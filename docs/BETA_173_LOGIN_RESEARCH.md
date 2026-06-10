@@ -10,9 +10,10 @@ serverbound login trace confirms the client sent this value. The Rust protocol
 crate exposes it as `BETA_173_PROTOCOL_VERSION`.
 
 `ServerboundLoginPacket` is now the observed client-to-server login model.
-`ServerboundLoginPacketCodec` is registered in `PacketCodecRegistry` for packet
-ID `0x01`. Aurelia has an explicit `--experimental-join` path that can send
-provisional server-to-client login response candidates, spawn position,
+`PacketCodecRegistry` metadata names `C->S 0x01` as `Login` separately from
+`S->C 0x01` `LoginResponse`. Aurelia has an explicit `--experimental-join`
+path that can send provisional server-to-client login response candidates,
+spawn position,
 player position/look, chunk visibility, and chunk data. The `beta173-observed`
 mode is now the recommended experimental mode because a real client accepted it
 far enough to send movement packets. These packets are still not verified as

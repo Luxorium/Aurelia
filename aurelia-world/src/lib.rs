@@ -9,6 +9,402 @@ pub const SEA_LEVEL: usize = 64;
 pub const FLAT_GRASS_Y: usize = 63;
 pub const SPAWN_POSITION: BlockPos = BlockPos::new(0, 65, 0);
 
+pub mod beta173 {
+    use aurelia_common::beta173::{self as item, ItemRule, ToolCategory, ToolTier};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Material {
+        Air,
+        Rock,
+        Dirt,
+        Wood,
+        Leaves,
+        Glass,
+        Sand,
+        Decoration,
+        Container,
+        Unbreakable,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct BlockRule {
+        pub id: u8,
+        pub debug_name: &'static str,
+        pub material: Material,
+        pub hardness: f32,
+        pub preferred_tool: Option<ToolCategory>,
+        pub minimum_tier: Option<ToolTier>,
+        pub solid: bool,
+        pub transparent: bool,
+        pub light_emission: u8,
+        pub drop: BlockDrop,
+        pub approximate: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BlockDrop {
+        Nothing,
+        SelfItem,
+        Item {
+            item_id: i16,
+            count: u8,
+            damage: i16,
+        },
+        RequiresTool {
+            item_id: i16,
+            count: u8,
+            damage: i16,
+        },
+    }
+
+    impl BlockRule {
+        pub fn can_harvest(self, held: Option<ItemRule>) -> bool {
+            match self.drop {
+                BlockDrop::RequiresTool { .. } => self.has_required_tool(held),
+                _ => true,
+            }
+        }
+
+        pub fn drop_for(self, held: Option<ItemRule>, metadata: u8) -> Option<(i16, u8, i16)> {
+            match self.drop {
+                BlockDrop::Nothing => None,
+                BlockDrop::SelfItem => Some((i16::from(self.id), 1, i16::from(metadata & 0x0F))),
+                BlockDrop::Item {
+                    item_id,
+                    count,
+                    damage,
+                } => Some((item_id, count, damage)),
+                BlockDrop::RequiresTool {
+                    item_id,
+                    count,
+                    damage,
+                } => self
+                    .has_required_tool(held)
+                    .then_some((item_id, count, damage)),
+            }
+        }
+
+        fn has_required_tool(self, held: Option<ItemRule>) -> bool {
+            let Some(required_category) = self.preferred_tool else {
+                return true;
+            };
+            let Some(held) = held else {
+                return false;
+            };
+            if held.tool_category() != Some(required_category) {
+                return false;
+            }
+            match (self.minimum_tier, held.tool_tier()) {
+                (Some(required), Some(actual)) => actual >= required,
+                (None, Some(_)) => true,
+                _ => false,
+            }
+        }
+    }
+
+    pub fn block_rule(id: u8) -> BlockRule {
+        match i16::from(id) {
+            item::AIR => rule(
+                id,
+                "air",
+                Material::Air,
+                0.0,
+                None,
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::Nothing,
+                false,
+            ),
+            item::STONE => rule(
+                id,
+                "stone",
+                Material::Rock,
+                1.5,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                false,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::COBBLESTONE,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::GRASS => rule(
+                id,
+                "grass",
+                Material::Dirt,
+                0.6,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::Item {
+                    item_id: item::DIRT,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::DIRT => rule(
+                id,
+                "dirt",
+                Material::Dirt,
+                0.5,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::COBBLESTONE => rule(
+                id,
+                "cobblestone",
+                Material::Rock,
+                2.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                false,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::COBBLESTONE,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::PLANKS => rule(
+                id,
+                "planks",
+                Material::Wood,
+                2.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::BEDROCK => rule(
+                id,
+                "bedrock",
+                Material::Unbreakable,
+                -1.0,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::Nothing,
+                false,
+            ),
+            item::SAND => rule(
+                id,
+                "sand",
+                Material::Sand,
+                0.5,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::GRAVEL => rule(
+                id,
+                "gravel",
+                Material::Sand,
+                0.6,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::GOLD_ORE => ore(id, "gold_ore", item::GOLD_ORE, ToolTier::Iron),
+            item::IRON_ORE => ore(id, "iron_ore", item::IRON_ORE, ToolTier::Stone),
+            item::COAL_ORE => ore(id, "coal_ore", item::COAL, ToolTier::Wood),
+            item::LOG => rule(
+                id,
+                "log",
+                Material::Wood,
+                2.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::LEAVES => rule(
+                id,
+                "leaves",
+                Material::Leaves,
+                0.2,
+                None,
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::GLASS => rule(
+                id,
+                "glass",
+                Material::Glass,
+                0.3,
+                None,
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::TORCH => rule(
+                id,
+                "torch",
+                Material::Decoration,
+                0.0,
+                None,
+                None,
+                false,
+                true,
+                14,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::CHEST => rule(
+                id,
+                "chest",
+                Material::Container,
+                2.5,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::DIAMOND_ORE => ore(id, "diamond_ore", item::DIAMOND_ORE, ToolTier::Iron),
+            item::CRAFTING_TABLE => rule(
+                id,
+                "crafting_table",
+                Material::Wood,
+                2.5,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::FURNACE | item::LIT_FURNACE => rule(
+                id,
+                "furnace",
+                Material::Rock,
+                3.5,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                false,
+                if i16::from(id) == item::LIT_FURNACE {
+                    13
+                } else {
+                    0
+                },
+                BlockDrop::RequiresTool {
+                    item_id: item::FURNACE,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::REDSTONE_ORE | item::GLOWING_REDSTONE_ORE => {
+                ore(id, "redstone_ore", item::REDSTONE_ORE, ToolTier::Iron)
+            }
+            _ => rule(
+                id,
+                "unknown",
+                Material::Rock,
+                1.0,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+        }
+    }
+
+    fn ore(id: u8, name: &'static str, item_id: i16, tier: ToolTier) -> BlockRule {
+        rule(
+            id,
+            name,
+            Material::Rock,
+            3.0,
+            Some(ToolCategory::Pickaxe),
+            Some(tier),
+            true,
+            false,
+            0,
+            BlockDrop::RequiresTool {
+                item_id,
+                count: 1,
+                damage: 0,
+            },
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    const fn rule(
+        id: u8,
+        debug_name: &'static str,
+        material: Material,
+        hardness: f32,
+        preferred_tool: Option<ToolCategory>,
+        minimum_tier: Option<ToolTier>,
+        solid: bool,
+        transparent: bool,
+        light_emission: u8,
+        drop: BlockDrop,
+        approximate: bool,
+    ) -> BlockRule {
+        BlockRule {
+            id,
+            debug_name,
+            material,
+            hardness,
+            preferred_tool,
+            minimum_tier,
+            solid,
+            transparent,
+            light_emission,
+            drop,
+            approximate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockState {
     pub id: u8,
@@ -631,6 +1027,34 @@ mod tests {
             entities.despawn(player).map(|entity| entity.kind)
         );
         assert_eq!(1, entities.len());
+    }
+
+    #[test]
+    fn beta173_block_rules_cover_harvest_and_drops() {
+        let dirt = beta173::block_rule(3);
+        assert_eq!(beta173::Material::Dirt, dirt.material);
+        assert_eq!(Some((3, 1, 0)), dirt.drop_for(None, 0));
+
+        let stone = beta173::block_rule(1);
+        assert_eq!(None, stone.drop_for(None, 0));
+        assert_eq!(
+            Some((4, 1, 0)),
+            stone.drop_for(Some(aurelia_common::beta173::item_rule(270)), 0)
+        );
+
+        let glass = beta173::block_rule(20);
+        assert_eq!(None, glass.drop_for(None, 0));
+        assert!(glass.transparent);
+
+        let iron_ore = beta173::block_rule(15);
+        assert_eq!(
+            None,
+            iron_ore.drop_for(Some(aurelia_common::beta173::item_rule(270)), 0)
+        );
+        assert_eq!(
+            Some((15, 1, 0)),
+            iron_ore.drop_for(Some(aurelia_common::beta173::item_rule(274)), 0)
+        );
     }
 
     fn test_world_dir(name: &str) -> std::path::PathBuf {

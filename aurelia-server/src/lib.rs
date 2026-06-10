@@ -1,4 +1,4 @@
-use aurelia_common::{BlockPos, ChunkPos};
+use aurelia_common::{beta173 as item_rules, BlockPos, ChunkPos, ChunkView};
 use aurelia_protocol::{
     experimental_flat_chunk_data, read_u8, ChatPacket, ClientboundBeta173TimeUpdatePacket,
     ClientboundBeta173TimeUpdatePacketCodec, ClientboundBlockChangePacket,
@@ -21,12 +21,13 @@ use aurelia_protocol::{
 };
 use aurelia_region::RegionScheduler;
 use aurelia_world::{
-    BlockState, Chunk, EntityId, EntityKind, EntityManager, FlatWorldGenerator,
-    InMemoryWorldStorage, World,
+    beta173 as block_rules, BlockState, Chunk, EntityId, EntityKind, EntityManager,
+    FlatWorldGenerator, InMemoryWorldStorage, World,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const VERSION: &str = "0.1.3-SNAPSHOT";
+pub const VERSION: &str = "0.2.0-SNAPSHOT";
 pub const HANDSHAKE_RECEIVED_DISCONNECT: &str =
     "Aurelia received your handshake, but login is not implemented yet.";
 pub const MISSING_PACKET_DISCONNECT: &str =
@@ -58,8 +59,8 @@ pub mod trace {
     use aurelia_protocol::{
         movement_payload_length, ClientboundBlockChangePacket, ClientboundChunkDataPacket,
         ClientboundChunkVisibilityPacket, ClientboundPlayerPositionLookPacket,
-        ClientboundSpawnPositionPacket, DisconnectPacket, HandshakePacket, PacketDirection,
-        ServerboundLoginPacket,
+        ClientboundSpawnPositionPacket, DisconnectPacket, HandshakePacket, PacketCodecRegistry,
+        PacketDirection,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,34 +121,19 @@ pub mod trace {
     }
 
     pub fn packet_trace_name(direction: PacketDirection, packet_id: u8) -> Option<&'static str> {
-        if packet_id == ServerboundLoginPacket::ID {
-            return match direction {
-                PacketDirection::ClientToServer => Some("Login"),
-                PacketDirection::ServerToClient => Some("LoginResponse"),
-            };
+        let registry = PacketCodecRegistry::beta173_defaults();
+        if let Some(name) = registry.packet_name(direction, packet_id) {
+            return Some(name);
         }
 
         match packet_id {
-            0x00 => Some("KeepAlive"),
-            0x03 => Some("Chat"),
-            0x04 => Some("TimeUpdate"),
             id if id == ClientboundSpawnPositionPacket::ID => Some("SpawnPosition"),
             id if id == ClientboundPlayerPositionLookPacket::ID => Some("PlayerPositionLook"),
             id if id == ClientboundChunkVisibilityPacket::ID => Some("SetChunkVisibility"),
             id if id == ClientboundChunkDataPacket::ID => Some("ChunkData"),
             id if id == ClientboundBlockChangePacket::ID => Some("BlockChange"),
-            0x67 => Some("SetSlot"),
-            0x68 => Some("SetWindowItems"),
             id if id == HandshakePacket::ID => Some("Handshake"),
             id if id == DisconnectPacket::ID => Some("Disconnect"),
-            0x0E => Some("PlayerDigging"),
-            0x0F => Some("PlayerBlockPlacement"),
-            0x10 => Some("HeldItemChange"),
-            0x12 => Some("Animation"),
-            0x13 => Some("EntityAction"),
-            0x65 => Some("CloseWindow"),
-            0x66 => Some("WindowClick"),
-            0x6A => Some("ConfirmTransaction"),
             id if movement_payload_length(id).is_some() => match id {
                 0x0A => Some("Player"),
                 0x0B => Some("PlayerPosition"),
@@ -217,8 +203,66 @@ pub struct ServerConfig {
     pub inventory_sync_enabled: bool,
     pub time_update_enabled: bool,
     pub keepalive_enabled: bool,
+    pub time_update_mode: TimeUpdateMode,
+    pub keepalive_mode: KeepAliveMode,
     pub defer_inventory_sync: bool,
     pub post_join_minimal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeUpdateMode {
+    Off,
+    Once,
+    Interval,
+}
+
+impl TimeUpdateMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "once" => Ok(Self::Once),
+            "interval" => Ok(Self::Interval),
+            _ => Err(ServerError::InvalidConfig(format!(
+                "invalid time update mode: {value}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Once => "once",
+            Self::Interval => "interval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepAliveMode {
+    Off,
+    ServerboundNoPayload,
+    ServerboundInt32,
+}
+
+impl KeepAliveMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "serverbound-no-payload" => Ok(Self::ServerboundNoPayload),
+            "serverbound-int32" => Ok(Self::ServerboundInt32),
+            _ => Err(ServerError::InvalidConfig(format!(
+                "invalid keepalive mode: {value}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ServerboundNoPayload => "serverbound-no-payload",
+            Self::ServerboundInt32 => "serverbound-int32",
+        }
+    }
 }
 
 impl ServerConfig {
@@ -311,6 +355,16 @@ impl ServerConfig {
             inventory_sync_enabled,
             time_update_enabled,
             keepalive_enabled,
+            time_update_mode: if time_update_enabled {
+                TimeUpdateMode::Once
+            } else {
+                TimeUpdateMode::Off
+            },
+            keepalive_mode: if keepalive_enabled {
+                KeepAliveMode::ServerboundNoPayload
+            } else {
+                KeepAliveMode::Off
+            },
             defer_inventory_sync,
             post_join_minimal,
         };
@@ -334,6 +388,8 @@ impl ServerConfig {
             inventory_sync_enabled: true,
             time_update_enabled: true,
             keepalive_enabled: true,
+            time_update_mode: TimeUpdateMode::Once,
+            keepalive_mode: KeepAliveMode::ServerboundNoPayload,
             defer_inventory_sync: true,
             post_join_minimal: false,
         }
@@ -380,6 +436,8 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     let mut inventory_sync_enabled = defaults.inventory_sync_enabled;
     let mut time_update_enabled = defaults.time_update_enabled;
     let mut keepalive_enabled = defaults.keepalive_enabled;
+    let mut time_update_mode = defaults.time_update_mode;
+    let mut keepalive_mode = defaults.keepalive_mode;
     let mut defer_inventory_sync = defaults.defer_inventory_sync;
     let mut post_join_minimal = defaults.post_join_minimal;
 
@@ -443,8 +501,26 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
             inventory_sync_enabled = false;
         } else if arg == "--no-time-update" {
             time_update_enabled = false;
+            time_update_mode = TimeUpdateMode::Off;
+        } else if let Some(value) = arg.strip_prefix("--time-update-mode=") {
+            time_update_mode = TimeUpdateMode::parse(value)?;
+            time_update_enabled = time_update_mode != TimeUpdateMode::Off;
+        } else if arg == "--time-update-mode" {
+            index += 1;
+            time_update_mode =
+                TimeUpdateMode::parse(required_arg_value(args, index, "--time-update-mode")?)?;
+            time_update_enabled = time_update_mode != TimeUpdateMode::Off;
         } else if arg == "--no-keepalive" {
             keepalive_enabled = false;
+            keepalive_mode = KeepAliveMode::Off;
+        } else if let Some(value) = arg.strip_prefix("--keepalive-mode=") {
+            keepalive_mode = KeepAliveMode::parse(value)?;
+            keepalive_enabled = keepalive_mode != KeepAliveMode::Off;
+        } else if arg == "--keepalive-mode" {
+            index += 1;
+            keepalive_mode =
+                KeepAliveMode::parse(required_arg_value(args, index, "--keepalive-mode")?)?;
+            keepalive_enabled = keepalive_mode != KeepAliveMode::Off;
         } else if arg == "--defer-inventory-sync" {
             defer_inventory_sync = true;
         } else if arg == "--post-join-minimal" {
@@ -453,7 +529,7 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
         index += 1;
     }
 
-    ServerConfig::with_options_and_features(
+    let mut config = ServerConfig::with_options_and_features(
         host,
         port,
         world_name,
@@ -470,7 +546,11 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
         keepalive_enabled,
         defer_inventory_sync,
         post_join_minimal,
-    )
+    )?;
+    config.time_update_mode = time_update_mode;
+    config.keepalive_mode = keepalive_mode;
+    config.validate()?;
+    Ok(config)
 }
 
 fn required_arg_value<'a>(
@@ -532,6 +612,12 @@ pub enum JoinPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameMode {
     Survival,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerLifeState {
+    Alive,
+    Dead,
 }
 
 pub type SharedGameServerState = Arc<Mutex<GameServerState>>;
@@ -638,6 +724,29 @@ impl GameServerState {
         Ok(self.world.save_dirty_chunks(path)?)
     }
 
+    pub fn save_player_state(&self, player: &PlayerState) -> Result<()> {
+        let Some(chunk_path) = self.world_save_dir.as_ref() else {
+            return Ok(());
+        };
+        write_player_file(&player_save_dir(chunk_path), player)?;
+        Ok(())
+    }
+
+    pub fn load_player_state(
+        &self,
+        username: &str,
+        entity_id: EntityId,
+    ) -> Result<Option<PlayerState>> {
+        let Some(chunk_path) = self.world_save_dir.as_ref() else {
+            return Ok(None);
+        };
+        read_player_file(
+            &player_file_path(&player_save_dir(chunk_path), username),
+            entity_id,
+        )
+        .map_err(ServerError::Io)
+    }
+
     pub fn register_player(&mut self, username: impl Into<String>) -> EntityId {
         let username = username.into();
         if let Some(id) = self.players.get(&username) {
@@ -741,8 +850,6 @@ impl PlayerInventory {
     pub const CURSOR_WINDOW_ID: i8 = -1;
     pub const CURSOR_SLOT: i16 = -1;
     pub const DROP_SLOT: i16 = -999;
-    const MAX_STACK_SIZE: u8 = 64;
-
     pub fn starter() -> Self {
         let mut inventory = Self {
             slots: vec![LegacySlotData::Empty; Self::WINDOW_SLOT_COUNT],
@@ -755,6 +862,14 @@ impl PlayerInventory {
         inventory.set_hotbar_stack(3, stack(50, 64, 0));
         inventory.set_hotbar_stack(4, stack(270, 1, 0));
         inventory
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            slots: vec![LegacySlotData::Empty; Self::WINDOW_SLOT_COUNT],
+            cursor: LegacySlotData::Empty,
+            selected_hotbar_slot: 0,
+        }
     }
 
     pub fn slots(&self) -> &[LegacySlotData] {
@@ -789,6 +904,14 @@ impl PlayerInventory {
         }
     }
 
+    pub fn set_slot(&mut self, slot: i16, stack: LegacySlotData) -> bool {
+        if slot < 0 || slot as usize >= self.slots.len() {
+            return false;
+        }
+        self.slots[slot as usize] = stack;
+        true
+    }
+
     pub fn placeable_selected_block(&self) -> Option<BlockState> {
         let LegacySlotData::Present {
             item_id,
@@ -798,7 +921,8 @@ impl PlayerInventory {
         else {
             return None;
         };
-        if count == 0 || !is_placeable_block_id(item_id) {
+        let rule = item_rules::item_rule(item_id);
+        if count == 0 || !rule.is_placeable() || !(0..=u8::MAX as i16).contains(&item_id) {
             return None;
         }
         Some(BlockState::new_unchecked(
@@ -831,9 +955,9 @@ impl PlayerInventory {
             else {
                 continue;
             };
-            if *slot_item == item_id && *slot_damage == damage && *slot_count < Self::MAX_STACK_SIZE
-            {
-                let added = (Self::MAX_STACK_SIZE - *slot_count).min(remaining);
+            let max_stack_size = item_rules::item_rule(item_id).max_stack_size;
+            if *slot_item == item_id && *slot_damage == damage && *slot_count < max_stack_size {
+                let added = (max_stack_size - *slot_count).min(remaining);
                 *slot_count += added;
                 remaining -= added;
                 changed.push(index as i16);
@@ -845,7 +969,7 @@ impl PlayerInventory {
                 break;
             }
             if *slot == LegacySlotData::Empty {
-                let added = Self::MAX_STACK_SIZE.min(remaining);
+                let added = item_rules::item_rule(item_id).max_stack_size.min(remaining);
                 *slot = stack(item_id, added, damage);
                 remaining -= added;
                 changed.push(index as i16);
@@ -906,7 +1030,8 @@ impl PlayerInventory {
                     damage: slot_damage,
                 },
             ) if item_id == slot_item_id && damage == slot_damage => {
-                let space = Self::MAX_STACK_SIZE.saturating_sub(slot_count);
+                let max_stack_size = item_rules::item_rule(item_id).max_stack_size;
+                let space = max_stack_size.saturating_sub(slot_count);
                 let moved = space.min(count);
                 self.slots[slot] = stack(slot_item_id, slot_count + moved, slot_damage);
                 self.cursor = if moved == count {
@@ -970,7 +1095,7 @@ impl PlayerInventory {
                 },
             ) if item_id == slot_item_id
                 && damage == slot_damage
-                && slot_count < Self::MAX_STACK_SIZE =>
+                && slot_count < item_rules::item_rule(item_id).max_stack_size =>
             {
                 self.slots[slot] = stack(slot_item_id, slot_count + 1, slot_damage);
                 self.cursor = if count == 1 {
@@ -1087,10 +1212,7 @@ fn selected_placeable_block(inventory: PlacementInventorySnapshot) -> BlockState
 }
 
 fn is_placeable_block_id(item_id: i16) -> bool {
-    matches!(
-        item_id,
-        1..=6 | 12..=24 | 35 | 41..=50 | 53..=58 | 61..=67 | 79..=91
-    )
+    item_rules::item_rule(item_id).is_placeable() && (0..=u8::MAX as i16).contains(&item_id)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1099,6 +1221,10 @@ pub struct PlayerState {
     pub entity_id: EntityId,
     pub game_mode: GameMode,
     pub health: i32,
+    pub life_state: PlayerLifeState,
+    pub spawn_x: f64,
+    pub spawn_y: f64,
+    pub spawn_z: f64,
     pub x: f64,
     pub y: f64,
     pub stance: f64,
@@ -1122,6 +1248,10 @@ impl PlayerState {
             entity_id,
             game_mode: GameMode::Survival,
             health: 20,
+            life_state: PlayerLifeState::Alive,
+            spawn_x: x,
+            spawn_y: y,
+            spawn_z: z,
             x,
             y,
             stance: 67.62,
@@ -1137,6 +1267,8 @@ impl PlayerState {
     }
 
     pub fn apply_movement(&mut self, movement: ServerboundMovementPacket) {
+        let previous_y = self.y;
+        let was_on_ground = self.on_ground;
         match movement {
             ServerboundMovementPacket::Player { on_ground } => {
                 self.on_ground = on_ground;
@@ -1182,6 +1314,12 @@ impl PlayerState {
             }
         }
         self.current_chunk = ChunkPos::from_block(self.x.floor() as i32, self.z.floor() as i32);
+        if self.y < -64.0 {
+            self.apply_damage(4);
+        } else if self.on_ground && !was_on_ground && previous_y - self.y > 3.0 {
+            let damage = (previous_y - self.y - 3.0).floor() as i32;
+            self.apply_damage(damage.max(0));
+        }
     }
 
     pub fn set_hotbar_slot(&mut self, slot: u8) {
@@ -1206,6 +1344,218 @@ impl PlayerState {
         let dz = (pos.z as f64 + 0.5) - self.z;
         (dx * dx) + (dy * dy) + (dz * dz) <= MAX_REACH_SQUARED
     }
+
+    pub fn apply_damage(&mut self, amount: i32) {
+        if amount <= 0 || self.life_state == PlayerLifeState::Dead {
+            return;
+        }
+        self.health = (self.health - amount).max(0);
+        if self.health == 0 {
+            self.life_state = PlayerLifeState::Dead;
+        }
+    }
+
+    pub fn respawn_at_spawn(&mut self) {
+        self.health = 20;
+        self.life_state = PlayerLifeState::Alive;
+        self.x = self.spawn_x;
+        self.y = self.spawn_y;
+        self.stance = self.spawn_y + 1.62;
+        self.z = self.spawn_z;
+        self.on_ground = false;
+        self.current_chunk = ChunkPos::from_block(self.x.floor() as i32, self.z.floor() as i32);
+    }
+}
+
+fn player_save_dir(chunk_save_dir: &Path) -> PathBuf {
+    chunk_save_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("aurelia-players-v1")
+}
+
+fn player_file_path(dir: &Path, username: &str) -> PathBuf {
+    dir.join(format!("{}.aplayer", sanitized_player_name(username)))
+}
+
+fn sanitized_player_name(username: &str) -> String {
+    username
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_player_file(dir: &Path, player: &PlayerState) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let mut file = File::create(player_file_path(dir, &player.username))?;
+    writeln!(file, "AURELIA-PLAYER-1")?;
+    writeln!(file, "username={}", player.username)?;
+    writeln!(file, "x={}", player.x)?;
+    writeln!(file, "y={}", player.y)?;
+    writeln!(file, "stance={}", player.stance)?;
+    writeln!(file, "z={}", player.z)?;
+    writeln!(file, "yaw={}", player.yaw)?;
+    writeln!(file, "pitch={}", player.pitch)?;
+    writeln!(file, "health={}", player.health)?;
+    writeln!(
+        file,
+        "alive={}",
+        matches!(player.life_state, PlayerLifeState::Alive)
+    )?;
+    writeln!(file, "spawn_x={}", player.spawn_x)?;
+    writeln!(file, "spawn_y={}", player.spawn_y)?;
+    writeln!(file, "spawn_z={}", player.spawn_z)?;
+    writeln!(file, "selected_hotbar={}", player.selected_hotbar_slot)?;
+    for (slot, stack) in player.inventory.slots().iter().enumerate() {
+        match stack {
+            LegacySlotData::Empty => writeln!(file, "slot.{slot}=empty")?,
+            LegacySlotData::Present {
+                item_id,
+                count,
+                damage,
+            } => writeln!(file, "slot.{slot}={item_id},{count},{damage}")?,
+        }
+    }
+    Ok(())
+}
+
+fn read_player_file(path: &Path, entity_id: EntityId) -> io::Result<Option<PlayerState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)?;
+    let mut lines = text.lines();
+    if lines.next() != Some("AURELIA-PLAYER-1") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Aurelia player magic",
+        ));
+    }
+
+    let mut values = HashMap::new();
+    let mut slots = vec![LegacySlotData::Empty; PlayerInventory::WINDOW_SLOT_COUNT];
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if let Some(slot) = key.strip_prefix("slot.") {
+            let Ok(slot) = slot.parse::<usize>() else {
+                continue;
+            };
+            if slot >= slots.len() {
+                continue;
+            }
+            slots[slot] = parse_saved_slot(value)?;
+        } else {
+            values.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    let username = values
+        .remove("username")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing username"))?;
+    let x = parse_saved_f64(&values, "x")?;
+    let y = parse_saved_f64(&values, "y")?;
+    let z = parse_saved_f64(&values, "z")?;
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots = slots;
+    let selected_hotbar_slot = parse_saved_u8(&values, "selected_hotbar")?.min(8);
+    inventory.set_selected_hotbar_slot(selected_hotbar_slot);
+    let life_state = if parse_saved_bool(&values, "alive")? {
+        PlayerLifeState::Alive
+    } else {
+        PlayerLifeState::Dead
+    };
+    Ok(Some(PlayerState {
+        username,
+        entity_id,
+        game_mode: GameMode::Survival,
+        health: parse_saved_i32(&values, "health")?.clamp(0, 20),
+        life_state,
+        spawn_x: parse_saved_f64(&values, "spawn_x")?,
+        spawn_y: parse_saved_f64(&values, "spawn_y")?,
+        spawn_z: parse_saved_f64(&values, "spawn_z")?,
+        x,
+        y,
+        stance: parse_saved_f64(&values, "stance")?,
+        z,
+        yaw: parse_saved_f32(&values, "yaw")?,
+        pitch: parse_saved_f32(&values, "pitch")?,
+        on_ground: false,
+        current_chunk: ChunkPos::from_block(x.floor() as i32, z.floor() as i32),
+        selected_hotbar_slot,
+        crouching: false,
+        inventory,
+    }))
+}
+
+fn parse_saved_slot(value: &str) -> io::Result<LegacySlotData> {
+    if value == "empty" {
+        return Ok(LegacySlotData::Empty);
+    }
+    let parts = value.split(',').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid saved inventory slot",
+        ));
+    }
+    let item_id = parts[0]
+        .parse::<i16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid item id"))?;
+    let count = parts[1]
+        .parse::<u8>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid item count"))?;
+    let damage = parts[2]
+        .parse::<i16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid item damage"))?;
+    Ok(stack(item_id, count, damage))
+}
+
+fn parse_saved_f64(values: &HashMap<String, String>, key: &str) -> io::Result<f64> {
+    values
+        .get(key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {key}")))
+}
+
+fn parse_saved_f32(values: &HashMap<String, String>, key: &str) -> io::Result<f32> {
+    values
+        .get(key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {key}")))
+}
+
+fn parse_saved_i32(values: &HashMap<String, String>, key: &str) -> io::Result<i32> {
+    values
+        .get(key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {key}")))
+}
+
+fn parse_saved_u8(values: &HashMap<String, String>, key: &str) -> io::Result<u8> {
+    values
+        .get(key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {key}")))
+}
+
+fn parse_saved_bool(values: &HashMap<String, String>, key: &str) -> io::Result<bool> {
+    values
+        .get(key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {key}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1219,6 +1569,25 @@ struct PlacementInventorySnapshot {
     hotbar_index: u8,
     window_slot: i16,
     selected_stack: LegacySlotData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveDiggingState {
+    target: BlockPos,
+    face: i8,
+    block_at_start: BlockState,
+    held_item_at_start: LegacySlotData,
+    start_tick: u64,
+    progress: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeepAliveReceive {
+    id: Option<i32>,
+    raw: [u8; 4],
+    raw_len: usize,
+    matched_expected: bool,
+    likely_packet_bytes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1254,10 +1623,13 @@ pub struct PlayerSession {
     join_phase: JoinPhase,
     player: Option<PlayerState>,
     registered_username: Option<String>,
-    sent_chunks: HashSet<ChunkPos>,
+    chunk_view: ChunkView,
     last_packet_id: Option<u8>,
     last_clientbound_packet_id: Option<u8>,
     last_clientbound_payload_len: usize,
+    last_serverbound_packets: VecDeque<String>,
+    last_clientbound_packets: VecDeque<String>,
+    raw_byte_diagnostics: VecDeque<u8>,
     trace_index: usize,
     last_packet_at: Instant,
     last_keepalive_sent_at: Instant,
@@ -1266,6 +1638,9 @@ pub struct PlayerSession {
     inventory_sync_sent: bool,
     next_keepalive_id: i32,
     pending_keepalive_id: Option<i32>,
+    last_keepalive_received: Option<KeepAliveReceive>,
+    last_time_update_tick: Option<u64>,
+    active_digging: Option<ActiveDiggingState>,
 }
 
 impl PlayerSession {
@@ -1280,6 +1655,7 @@ impl PlayerSession {
 
     pub fn with_state(config: ServerConfig, state_ref: SharedGameServerState) -> Self {
         let now = Instant::now();
+        let chunk_radius = config.initial_chunk_radius;
         Self {
             config,
             state_ref,
@@ -1287,10 +1663,13 @@ impl PlayerSession {
             join_phase: JoinPhase::Handshaking,
             player: None,
             registered_username: None,
-            sent_chunks: HashSet::new(),
+            chunk_view: ChunkView::new(ChunkPos::new(0, 0), chunk_radius),
             last_packet_id: None,
             last_clientbound_packet_id: None,
             last_clientbound_payload_len: 0,
+            last_serverbound_packets: VecDeque::new(),
+            last_clientbound_packets: VecDeque::new(),
+            raw_byte_diagnostics: VecDeque::new(),
             trace_index: 0,
             last_packet_at: now,
             last_keepalive_sent_at: now,
@@ -1299,6 +1678,9 @@ impl PlayerSession {
             inventory_sync_sent: false,
             next_keepalive_id: 1,
             pending_keepalive_id: None,
+            last_keepalive_received: None,
+            last_time_update_tick: None,
+            active_digging: None,
         }
     }
 
@@ -1462,7 +1844,14 @@ impl PlayerSession {
             state.register_player(username.clone())
         };
         self.registered_username = Some(username.clone());
-        self.player = Some(PlayerState::new(username, entity_id));
+        self.player = {
+            let state = self
+                .state_ref
+                .lock()
+                .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
+            state.load_player_state(&username, entity_id)?
+        }
+        .or_else(|| Some(PlayerState::new(username, entity_id)));
         self.send_join_sequence(connection)?;
         self.state = ConnectionState::Joined;
         Ok(None)
@@ -1474,6 +1863,7 @@ impl PlayerSession {
             let packet_id = match read_u8(connection) {
                 Ok(packet_id) => packet_id,
                 Err(ProtocolError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                    self.save_player_for_shutdown();
                     self.save_dirty_chunks_for_shutdown();
                     self.unregister_player();
                     self.log_session_close("client closed connection");
@@ -1491,15 +1881,15 @@ impl PlayerSession {
             self.last_packet_at = Instant::now();
 
             let packet_kind = ServerboundPacketKind::from_id(packet_id);
+            if packet_kind == ServerboundPacketKind::KeepAlive {
+                self.handle_serverbound_keepalive(connection)?;
+                continue;
+            }
             if let Some(payload_len) = packet_kind.fixed_payload_length() {
                 let mut payload = vec![0; payload_len];
                 connection.read_exact(&mut payload)?;
                 self.trace_packet(PacketDirection::ClientToServer, packet_id, &payload);
                 match packet_kind {
-                    ServerboundPacketKind::KeepAlive => {
-                        let packet = KeepAlivePacket::decode(&mut payload.as_slice())?;
-                        self.handle_keepalive(packet);
-                    }
                     ServerboundPacketKind::Player
                     | ServerboundPacketKind::PlayerPosition
                     | ServerboundPacketKind::PlayerLook
@@ -1612,6 +2002,7 @@ impl PlayerSession {
             if packet_id == DisconnectPacket::ID {
                 let packet = DisconnectPacketCodec::decode(connection)?;
                 self.state = ConnectionState::Disconnected;
+                self.save_player_for_shutdown();
                 self.save_dirty_chunks_for_shutdown();
                 self.unregister_player();
                 self.log_session_close(&format!("client disconnected: {}", packet.reason));
@@ -1653,15 +2044,23 @@ impl PlayerSession {
                 payload,
             )
         })?;
+        let position = self
+            .player
+            .as_ref()
+            .map(|player| ClientboundPlayerPositionLookPacket {
+                x: player.x,
+                y: player.y,
+                stance: player.stance,
+                z: player.z,
+                yaw: player.yaw,
+                pitch: player.pitch,
+                on_ground: player.on_ground,
+            })
+            .unwrap_or_else(ClientboundPlayerPositionLookPacket::default_spawn);
         self.write_clientbound_frame(
             connection,
             ClientboundPlayerPositionLookPacket::ID,
-            |payload| {
-                ClientboundPlayerPositionLookPacketCodec::encode(
-                    &ClientboundPlayerPositionLookPacket::default_spawn(),
-                    payload,
-                )
-            },
+            |payload| ClientboundPlayerPositionLookPacketCodec::encode(&position, payload),
         )?;
 
         self.join_phase = JoinPhase::SendingInitialWorld;
@@ -1675,7 +2074,7 @@ impl PlayerSession {
         eprintln!(
             "[session] join phase: initial chunks complete player={} sentChunks={}",
             self.player_name_for_log(),
-            self.sent_chunks.len()
+            self.chunk_view.visible().len()
         );
         self.join_phase = JoinPhase::AwaitingFirstClientMovement;
         eprintln!(
@@ -1749,11 +2148,15 @@ impl PlayerSession {
             return Ok(());
         };
         let center = player.current_chunk;
-        let needed = chunks_in_radius(center, self.chunk_radius());
-        for pos in needed {
-            if self.sent_chunks.insert(pos) {
-                self.write_chunk_pair(connection, pos)?;
-            }
+        let diff = self.chunk_view.update(center, self.chunk_radius());
+        for pos in diff.unload {
+            self.write_chunk_visibility(
+                connection,
+                ClientboundChunkVisibilityPacket::unload(pos.x, pos.z),
+            )?;
+        }
+        for pos in diff.load {
+            self.write_chunk_pair(connection, pos)?;
         }
         Ok(())
     }
@@ -1781,6 +2184,7 @@ impl PlayerSession {
         );
         self.last_clientbound_packet_id = Some(ClientboundLoginResponsePacket::ID);
         self.last_clientbound_payload_len = payload.len();
+        self.remember_clientbound_packet(ClientboundLoginResponsePacket::ID, payload.len());
         LegacyPacketFrameCodec::write(
             &PacketFrame::new(ClientboundLoginResponsePacket::ID, payload),
             connection,
@@ -1799,6 +2203,7 @@ impl PlayerSession {
         self.trace_packet(PacketDirection::ServerToClient, packet_id, &payload);
         self.last_clientbound_packet_id = Some(packet_id);
         self.last_clientbound_payload_len = payload.len();
+        self.remember_clientbound_packet(packet_id, payload.len());
         LegacyPacketFrameCodec::write(&PacketFrame::new(packet_id, payload), connection)?;
         Ok(())
     }
@@ -1809,20 +2214,26 @@ impl PlayerSession {
             Ok(state.chunk_snapshot(pos))
         })?;
         let packet = chunk_data_packet_from_chunk(&chunk);
-        self.write_clientbound_frame(
+        self.write_chunk_visibility(
             connection,
-            ClientboundChunkVisibilityPacket::ID,
-            |payload| {
-                ClientboundChunkVisibilityPacketCodec::encode(
-                    &ClientboundChunkVisibilityPacket::load(pos.x, pos.z),
-                    payload,
-                )
-            },
+            ClientboundChunkVisibilityPacket::load(pos.x, pos.z),
         )?;
         self.write_clientbound_frame(connection, ClientboundChunkDataPacket::ID, |payload| {
             ClientboundChunkDataPacketCodec::encode(&packet, payload)
         })?;
         Ok(())
+    }
+
+    fn write_chunk_visibility(
+        &mut self,
+        connection: &mut impl Write,
+        packet: ClientboundChunkVisibilityPacket,
+    ) -> Result<()> {
+        self.write_clientbound_frame(
+            connection,
+            ClientboundChunkVisibilityPacket::ID,
+            |payload| ClientboundChunkVisibilityPacketCodec::encode(&packet, payload),
+        )
     }
 
     fn handle_player_digging(
@@ -1840,22 +2251,71 @@ impl PlayerSession {
             .transpose()?
             .unwrap_or(BlockState::AIR);
 
-        if packet.status != ServerboundPlayerDiggingPacket::FINISHED_DIGGING_STATUS {
-            if valid && (!loaded || !reachable) {
+        if packet.status == ServerboundPlayerDiggingPacket::START_DIGGING_STATUS {
+            if !valid
+                || !loaded
+                || !reachable
+                || current == BlockState::AIR
+                || current == BlockState::BEDROCK
+            {
+                if valid {
+                    self.write_block_change(connection, pos, current)?;
+                }
+                let reason = if !valid {
+                    "invalid-y"
+                } else if !loaded {
+                    "target-unloaded"
+                } else if !reachable {
+                    "out-of-reach"
+                } else if current == BlockState::AIR {
+                    "air"
+                } else {
+                    "bedrock"
+                };
+                self.active_digging = None;
+                self.log_digging(packet, pos, current, status, "rejected", Some(reason));
+                return Ok(());
+            }
+            let held_item_at_start = self
+                .player
+                .as_ref()
+                .map(|player| player.inventory.selected_stack())
+                .unwrap_or(LegacySlotData::Empty);
+            let same_target = self
+                .active_digging
+                .map(|dig| dig.target == pos && dig.face == packet.face)
+                .unwrap_or(false);
+            if same_target {
+                if let Some(dig) = self.active_digging.as_mut() {
+                    dig.progress = dig.progress.saturating_add(1);
+                }
+                self.log_digging(packet, pos, current, status, "progress", None);
+            } else {
+                let start_tick = self.with_game_state(|state| Ok(state.world_time()))?;
+                self.active_digging = Some(ActiveDiggingState {
+                    target: pos,
+                    face: packet.face,
+                    block_at_start: current,
+                    held_item_at_start,
+                    start_tick,
+                    progress: 1,
+                });
+                self.log_digging(packet, pos, current, status, "tracking", None);
+            }
+            return Ok(());
+        }
+
+        if packet.status == ServerboundPlayerDiggingPacket::CANCEL_DIGGING_STATUS {
+            self.active_digging = None;
+            if valid {
                 self.write_block_change(connection, pos, current)?;
             }
-            self.log_digging(
-                packet,
-                pos,
-                current,
-                status,
-                if valid && (!loaded || !reachable) {
-                    "corrected"
-                } else {
-                    "ignored"
-                },
-                None,
-            );
+            self.log_digging(packet, pos, current, status, "cancelled", None);
+            return Ok(());
+        }
+
+        if packet.status != ServerboundPlayerDiggingPacket::FINISHED_DIGGING_STATUS {
+            self.log_digging(packet, pos, current, status, "ignored", None);
             return Ok(());
         }
 
@@ -1873,15 +2333,55 @@ impl PlayerSession {
             None
         };
 
+        if let Some(active) = self.active_digging {
+            if active.target != pos || active.face != packet.face {
+                self.active_digging = None;
+                if valid {
+                    self.write_block_change(connection, pos, current)?;
+                }
+                self.log_digging(
+                    packet,
+                    pos,
+                    current,
+                    status,
+                    "rejected",
+                    Some("target-changed"),
+                );
+                return Ok(());
+            }
+            if active.block_at_start != current {
+                self.active_digging = None;
+                if valid {
+                    self.write_block_change(connection, pos, current)?;
+                }
+                self.log_digging(
+                    packet,
+                    pos,
+                    current,
+                    status,
+                    "rejected",
+                    Some("block-changed"),
+                );
+                return Ok(());
+            }
+        }
+
         if let Some(reason) = reject_reason {
             if valid {
                 self.write_block_change(connection, pos, current)?;
             }
+            self.active_digging = None;
             self.log_digging(packet, pos, current, status, "rejected", Some(reason));
             return Ok(());
         }
 
-        let drop = drop_for_block(current);
+        let held_item = self
+            .player
+            .as_ref()
+            .and_then(|player| player.inventory.selected_stack().item_id())
+            .map(item_rules::item_rule);
+        let block_rule = block_rules::block_rule(current.id);
+        let drop = block_rule.drop_for(held_item, current.metadata);
         self.with_game_state(|state| {
             state.break_block(pos);
             Ok(())
@@ -1899,12 +2399,14 @@ impl PlayerSession {
                 format!("{item_id}x{count} inventory-full")
             };
         }
+        self.correct_selected_inventory_slot(connection)?;
+        self.active_digging = None;
         self.log_digging(
             packet,
             pos,
             current,
             status,
-            "broken",
+            "completed",
             Some(drop_result.as_str()),
         );
         Ok(())
@@ -1916,6 +2418,7 @@ impl PlayerSession {
         connection: &mut impl Write,
     ) -> Result<()> {
         if packet.is_special_item_use() {
+            self.correct_selected_inventory_slot(connection)?;
             self.log_item_use_air();
             return Ok(());
         }
@@ -1924,6 +2427,7 @@ impl PlayerSession {
         let Some(target) = placement_target_pos(clicked, packet.direction) else {
             let clicked_state = self.with_game_state(|state| Ok(state.block_at(clicked)))?;
             self.write_block_change(connection, clicked, clicked_state)?;
+            self.correct_selected_inventory_slot(connection)?;
             self.log_placement(
                 packet,
                 clicked,
@@ -1956,6 +2460,7 @@ impl PlayerSession {
             if let Some(target_state) = target_state {
                 self.write_block_change(connection, target, target_state)?;
             }
+            self.correct_selected_inventory_slot(connection)?;
             self.log_placement(
                 packet,
                 clicked,
@@ -1994,6 +2499,7 @@ impl PlayerSession {
                 None,
             );
         } else {
+            self.correct_selected_inventory_slot(connection)?;
             self.log_placement(
                 packet,
                 clicked,
@@ -2015,6 +2521,34 @@ impl PlayerSession {
             window_slot: player.inventory.selected_window_slot(),
             selected_stack: player.inventory.selected_stack(),
         })
+    }
+
+    fn correct_selected_inventory_slot(&mut self, connection: &mut impl Write) -> Result<()> {
+        if !self.config.inventory_sync_enabled || self.config.post_join_minimal {
+            return Ok(());
+        }
+        let Some(snapshot) = self.placement_inventory_snapshot() else {
+            return Ok(());
+        };
+        if self.join_phase == JoinPhase::JoinedReady {
+            self.write_set_slot(
+                connection,
+                PlayerInventory::WINDOW_ID,
+                snapshot.window_slot,
+                snapshot.selected_stack,
+            )
+        } else {
+            self.write_clientbound_frame(connection, ClientboundSetSlotPacket::ID, |payload| {
+                ClientboundSetSlotPacketCodec::encode(
+                    &ClientboundSetSlotPacket {
+                        window_id: PlayerInventory::WINDOW_ID,
+                        slot: snapshot.window_slot,
+                        slot_data: snapshot.selected_stack,
+                    },
+                    payload,
+                )
+            })
+        }
     }
 
     fn placement_rejection_reason(
@@ -2060,7 +2594,7 @@ impl PlayerSession {
         }
         let inventory = self.placement_inventory_snapshot();
         eprintln!(
-            "[session] item-use-air hotbar={} windowSlot={} item={} player={}",
+            "[session] item-use-air ignored safely hotbar={} windowSlot={} item={} player={}",
             inventory
                 .map(|snapshot| snapshot.hotbar_index.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
@@ -2233,7 +2767,7 @@ impl PlayerSession {
             return Ok("Empty command.".to_string());
         };
         match name {
-            "/aurelia" => Ok(format!("Aurelia {VERSION} survival polish")),
+            "/aurelia" => Ok(format!("Aurelia {VERSION} vanilla parity foundation")),
             "/whereami" => {
                 let Some(player) = self.player.as_ref() else {
                     return Ok("No player state.".to_string());
@@ -2252,6 +2786,7 @@ impl PlayerSession {
                 Ok("Starter hotbar restored.".to_string())
             }
             "/save" => {
+                self.save_player_state()?;
                 let saved = self.save_dirty_chunks()?;
                 Ok(format!("Saved {saved} dirty chunks."))
             }
@@ -2330,8 +2865,11 @@ impl PlayerSession {
 
     fn should_send_time_update(&self) -> bool {
         self.config.time_update_enabled
+            && self.config.time_update_mode != TimeUpdateMode::Off
             && !self.config.post_join_minimal
             && self.join_phase == JoinPhase::JoinedReady
+            && (self.config.time_update_mode == TimeUpdateMode::Interval
+                || self.last_time_update_tick.is_none())
     }
 
     fn send_inventory_window(&mut self, connection: &mut impl Write) -> Result<()> {
@@ -2467,6 +3005,13 @@ impl PlayerSession {
             },
         )?;
         self.last_time_sent_at = Instant::now();
+        self.last_time_update_tick = Some(time);
+        eprintln!(
+            "[session] sent time update mode={} time={} player={}",
+            self.config.time_update_mode.as_str(),
+            time,
+            self.player_name_for_log()
+        );
         Ok(())
     }
 
@@ -2496,7 +3041,8 @@ impl PlayerSession {
             return Ok(());
         }
         let now = Instant::now();
-        if self.config.time_update_enabled
+        if self.config.time_update_mode == TimeUpdateMode::Interval
+            && self.config.time_update_enabled
             && !self.config.post_join_minimal
             && now.duration_since(self.last_time_sent_at) >= Self::TIME_UPDATE_INTERVAL
         {
@@ -2521,15 +3067,69 @@ impl PlayerSession {
         Ok(None)
     }
 
-    fn handle_keepalive(&mut self, packet: KeepAlivePacket) {
-        if self.pending_keepalive_id == Some(packet.keep_alive_id) {
-            self.pending_keepalive_id = None;
+    fn handle_serverbound_keepalive(&mut self, connection: &mut impl Read) -> Result<()> {
+        match self.config.keepalive_mode {
+            KeepAliveMode::Off | KeepAliveMode::ServerboundNoPayload => {
+                self.trace_packet(PacketDirection::ClientToServer, KeepAlivePacket::ID, &[]);
+                self.last_keepalive_received = Some(KeepAliveReceive {
+                    id: None,
+                    raw: [0; 4],
+                    raw_len: 0,
+                    matched_expected: self.config.keepalive_mode
+                        == KeepAliveMode::ServerboundNoPayload,
+                    likely_packet_bytes: false,
+                });
+                if self.config.packet_tracing_enabled {
+                    eprintln!(
+                        "[session] received keepalive mode={} rawPayload=<empty> matchedExpected=true likelyPacketBytes=false pendingSent={:?} player={}",
+                        self.config.keepalive_mode.as_str(),
+                        self.pending_keepalive_id,
+                        self.player_name_for_log()
+                    );
+                }
+            }
+            KeepAliveMode::ServerboundInt32 => {
+                let mut payload = [0; 4];
+                connection.read_exact(&mut payload)?;
+                self.trace_packet(
+                    PacketDirection::ClientToServer,
+                    KeepAlivePacket::ID,
+                    &payload,
+                );
+                let packet = KeepAlivePacket::decode(&mut payload.as_slice())?;
+                let matched = self.pending_keepalive_id == Some(packet.keep_alive_id);
+                if matched {
+                    self.pending_keepalive_id = None;
+                }
+                let likely_packet_bytes = looks_like_repeated_player_packet_bytes(&payload);
+                self.last_keepalive_received = Some(KeepAliveReceive {
+                    id: Some(packet.keep_alive_id),
+                    raw: payload,
+                    raw_len: payload.len(),
+                    matched_expected: matched,
+                    likely_packet_bytes,
+                });
+                eprintln!(
+                    "[session] received keepalive mode={} id={} rawPayload={} matchedExpected={} likelyPacketBytes={} pendingSent={:?} player={}",
+                    self.config.keepalive_mode.as_str(),
+                    packet.keep_alive_id,
+                    trace::format_payload_hex(&payload),
+                    matched,
+                    likely_packet_bytes,
+                    self.pending_keepalive_id,
+                    self.player_name_for_log()
+                );
+                if likely_packet_bytes {
+                    self.log_suspicious_packet_decode(
+                        KeepAlivePacket::ID,
+                        Some(4),
+                        &payload,
+                        "keepalive payload resembles packet bytes",
+                    );
+                }
+            }
         }
-        eprintln!(
-            "[session] received keepalive id={} player={}",
-            packet.keep_alive_id,
-            self.player_name_for_log()
-        );
+        Ok(())
     }
 
     fn write_block_change(
@@ -2557,9 +3157,7 @@ impl PlayerSession {
 
     fn is_block_loaded_for_player(&self, pos: BlockPos) -> bool {
         GameServerState::is_valid_block_pos(pos)
-            && self
-                .sent_chunks
-                .contains(&ChunkPos::from_block(pos.x, pos.z))
+            && self.chunk_view.contains(ChunkPos::from_block(pos.x, pos.z))
             && self
                 .state_ref
                 .lock()
@@ -2602,6 +3200,23 @@ impl PlayerSession {
         }
     }
 
+    fn save_player_state(&self) -> Result<()> {
+        let Some(player) = self.player.as_ref() else {
+            return Ok(());
+        };
+        let state = self
+            .state_ref
+            .lock()
+            .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
+        state.save_player_state(player)
+    }
+
+    fn save_player_for_shutdown(&self) {
+        if let Err(error) = self.save_player_state() {
+            eprintln!("[session] player save failed: {error}");
+        }
+    }
+
     fn disconnect(
         &mut self,
         connection: &mut impl Write,
@@ -2620,6 +3235,10 @@ impl PlayerSession {
     }
 
     fn trace_packet(&mut self, direction: PacketDirection, packet_id: u8, payload: &[u8]) {
+        if direction == PacketDirection::ClientToServer {
+            self.remember_serverbound_packet(packet_id, payload.len());
+            self.remember_raw_bytes(packet_id, payload);
+        }
         if !self.config.packet_tracing_enabled || self.trace_index >= self.config.packet_trace_limit
         {
             return;
@@ -2640,6 +3259,27 @@ impl PlayerSession {
     }
 
     fn trace_payload_hex(&self, payload: &[u8]) -> String {
+        if payload.len() >= 17 {
+            let chunk_x = i32::from_be_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+            let chunk_z = i32::from_be_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+            let size_x = payload[8];
+            let size_y = payload[9];
+            let size_z = payload[10];
+            let uncompressed_size =
+                i32::from_be_bytes(payload[13..17].try_into().unwrap_or([0; 4]));
+            if size_x == 15 && size_y == 127 && size_z == 15 && uncompressed_size >= 0 {
+                let first_len = payload.len().min(24);
+                return format!(
+                    "chunk={},{} payloadLength={} compressedBytes={} uncompressedBytes={} firstBytes={}",
+                    chunk_x,
+                    chunk_z,
+                    payload.len(),
+                    payload.len().saturating_sub(17),
+                    uncompressed_size,
+                    trace::format_payload_hex(&payload[..first_len])
+                );
+            }
+        }
         const TRACE_HEX_BYTES: usize = 96;
         if payload.len() <= TRACE_HEX_BYTES {
             return trace::format_payload_hex(payload);
@@ -2649,6 +3289,67 @@ impl PlayerSession {
             trace::format_payload_hex(&payload[..TRACE_HEX_BYTES]),
             payload.len() - TRACE_HEX_BYTES
         )
+    }
+
+    fn remember_serverbound_packet(&mut self, packet_id: u8, payload_len: usize) {
+        let name = trace::packet_trace_name(PacketDirection::ClientToServer, packet_id)
+            .unwrap_or("Unknown");
+        push_limited(
+            &mut self.last_serverbound_packets,
+            format!("{name}(0x{packet_id:02X}, payloadLength={payload_len})"),
+            5,
+        );
+    }
+
+    fn remember_clientbound_packet(&mut self, packet_id: u8, payload_len: usize) {
+        let name = trace::packet_trace_name(PacketDirection::ServerToClient, packet_id)
+            .unwrap_or("Unknown");
+        push_limited(
+            &mut self.last_clientbound_packets,
+            format!("{name}(0x{packet_id:02X}, payloadLength={payload_len})"),
+            5,
+        );
+    }
+
+    fn remember_raw_bytes(&mut self, packet_id: u8, payload: &[u8]) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        self.raw_byte_diagnostics.push_back(packet_id);
+        for byte in payload.iter().copied().take(64) {
+            self.raw_byte_diagnostics.push_back(byte);
+        }
+        while self.raw_byte_diagnostics.len() > 256 {
+            self.raw_byte_diagnostics.pop_front();
+        }
+    }
+
+    fn log_suspicious_packet_decode(
+        &self,
+        packet_id: u8,
+        expected_payload_len: Option<usize>,
+        raw_payload: &[u8],
+        detail: &str,
+    ) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        let recent_raw = self
+            .raw_byte_diagnostics
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[compat] suspicious packet decode id=0x{packet_id:02X} expectedPayloadLength={} rawPayload={} nextBytes=<unavailable> recentRaw={} lastServerbound=[{}] lastClientbound=[{}] detail={}",
+            expected_payload_len
+                .map(|len| len.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            trace::format_payload_hex(raw_payload),
+            trace::format_payload_hex(&recent_raw),
+            self.last_serverbound_packets.iter().cloned().collect::<Vec<_>>().join(", "),
+            self.last_clientbound_packets.iter().cloned().collect::<Vec<_>>().join(", "),
+            detail
+        );
     }
 
     fn log_close_window(&self, packet: ServerboundCloseWindowPacket) {
@@ -2751,6 +3452,75 @@ impl PlayerSession {
             self.player_chunk_for_log(),
             reason
         );
+        self.log_disconnect_diagnostics();
+    }
+
+    fn log_disconnect_diagnostics(&self) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        let held_item = self
+            .placement_inventory_snapshot()
+            .map(|snapshot| slot_data_summary(snapshot.selected_stack))
+            .unwrap_or_else(|| "empty".to_string());
+        let selected_slot = self
+            .placement_inventory_snapshot()
+            .map(|snapshot| snapshot.hotbar_index.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        let player_pos = self
+            .player
+            .as_ref()
+            .map(|player| format!("{:.3},{:.3},{:.3}", player.x, player.y, player.z))
+            .unwrap_or_else(|| "<none>".to_string());
+        let active_digging = self
+            .active_digging
+            .map(|dig| {
+                format!(
+                    "target={},{},{} face={} block={} held={} startTick={} progress={}",
+                    dig.target.x,
+                    dig.target.y,
+                    dig.target.z,
+                    dig.face,
+                    dig.block_at_start.id,
+                    slot_data_summary(dig.held_item_at_start),
+                    dig.start_tick,
+                    dig.progress
+                )
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        let keepalive_received = self
+            .last_keepalive_received
+            .map(|received| {
+                format!(
+                    "id={:?} raw={} matched={} likelyPacketBytes={}",
+                    received.id,
+                    trace::format_payload_hex(&received.raw[..received.raw_len]),
+                    received.matched_expected,
+                    received.likely_packet_bytes
+                )
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        eprintln!(
+            "[compat] disconnect diagnostics phase={:?} lastServerbound={} lastClientbound={} serverboundHistory=[{}] clientboundHistory=[{}] pos={} chunk={} selectedHotbar={} heldItem={} activeDigging={} keepaliveSent={:?} keepaliveReceived={} timeUpdateMode={} lastTimeUpdateTick={:?}",
+            self.join_phase,
+            self.last_packet_id
+                .map(|id| format!("{}(0x{id:02X})", trace::packet_trace_name(PacketDirection::ClientToServer, id).unwrap_or("Unknown")))
+                .unwrap_or_else(|| "<none>".to_string()),
+            self.last_clientbound_packet_id
+                .map(|id| format!("{}(0x{id:02X}, payloadLength={})", trace::packet_trace_name(PacketDirection::ServerToClient, id).unwrap_or("Unknown"), self.last_clientbound_payload_len))
+                .unwrap_or_else(|| "<none>".to_string()),
+            self.last_serverbound_packets.iter().cloned().collect::<Vec<_>>().join(", "),
+            self.last_clientbound_packets.iter().cloned().collect::<Vec<_>>().join(", "),
+            player_pos,
+            self.player_chunk_for_log(),
+            selected_slot,
+            held_item,
+            active_digging,
+            self.pending_keepalive_id,
+            keepalive_received,
+            self.config.time_update_mode.as_str(),
+            self.last_time_update_tick
+        );
     }
 
     fn player_name_for_log(&self) -> &str {
@@ -2796,17 +3566,6 @@ impl PlayerSession {
     }
 }
 
-pub fn chunks_in_radius(center: ChunkPos, radius: i32) -> Vec<ChunkPos> {
-    let radius = radius.max(0);
-    let mut chunks = Vec::new();
-    for x in center.x - radius..=center.x + radius {
-        for z in center.z - radius..=center.z + radius {
-            chunks.push(ChunkPos::new(x, z));
-        }
-    }
-    chunks
-}
-
 pub fn placement_face_offset(direction: i8) -> Option<(i32, i32, i32)> {
     match direction {
         0 => Some((0, -1, 0)),
@@ -2845,15 +3604,6 @@ fn chunk_data_packet_from_chunk(chunk: &Chunk) -> ClientboundChunkDataPacket {
     )
 }
 
-fn drop_for_block(state: BlockState) -> Option<(i16, u8, i16)> {
-    match state.id {
-        0 | 7 => None,
-        1 => Some((4, 1, 0)),
-        2 | 3 => Some((3, 1, 0)),
-        id => Some((i16::from(id), 1, i16::from(state.metadata))),
-    }
-}
-
 fn digging_status_name(status: i8) -> &'static str {
     match status {
         0 => "start",
@@ -2876,6 +3626,17 @@ fn parse_u8_arg(value: &str) -> Option<u8> {
 
 fn is_read_timeout_error(error: &io::Error) -> bool {
     matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+fn looks_like_repeated_player_packet_bytes(bytes: &[u8; 4]) -> bool {
+    matches!(bytes, [0x0A, 0x01, 0x0A, 0x01] | [0x0A, 0x00, 0x0A, 0x00])
+}
+
+fn push_limited(queue: &mut VecDeque<String>, value: String, limit: usize) {
+    queue.push_back(value);
+    while queue.len() > limit {
+        queue.pop_front();
+    }
 }
 
 fn client_disconnect_during_send(error: &ServerError) -> Option<&io::Error> {
@@ -3142,6 +3903,7 @@ fn spawn_accept_loop(
                                     "client disconnected during join/send: {io_error}; {}",
                                     session.disconnect_correlation_for_log()
                                 );
+                                session.log_disconnect_diagnostics();
                             } else {
                                 eprintln!("connection handling failed: {error}");
                             }
@@ -3250,6 +4012,8 @@ mod tests {
         assert!(config.inventory_sync_enabled);
         assert!(config.time_update_enabled);
         assert!(config.keepalive_enabled);
+        assert_eq!(TimeUpdateMode::Once, config.time_update_mode);
+        assert_eq!(KeepAliveMode::ServerboundNoPayload, config.keepalive_mode);
         assert!(config.defer_inventory_sync);
         assert!(!config.post_join_minimal);
     }
@@ -3347,16 +4111,22 @@ mod tests {
             "--no-inventory-sync",
             "--no-time-update",
             "--no-keepalive",
+            "--time-update-mode=interval",
+            "--keepalive-mode=serverbound-int32",
             "--defer-inventory-sync",
             "--post-join-minimal",
         ])
         .unwrap();
 
         assert!(!config.inventory_sync_enabled);
-        assert!(!config.time_update_enabled);
-        assert!(!config.keepalive_enabled);
+        assert!(config.time_update_enabled);
+        assert!(config.keepalive_enabled);
+        assert_eq!(TimeUpdateMode::Interval, config.time_update_mode);
+        assert_eq!(KeepAliveMode::ServerboundInt32, config.keepalive_mode);
         assert!(config.defer_inventory_sync);
         assert!(config.post_join_minimal);
+        assert!(parse_config(&["--time-update-mode=nope"]).is_err());
+        assert!(parse_config(&["--keepalive-mode=nope"]).is_err());
     }
 
     #[test]
@@ -3817,6 +4587,7 @@ mod tests {
     fn post_join_minimal_suppresses_optional_clientbound_packets() {
         let mut config = playable_config(0);
         config.post_join_minimal = true;
+        config.keepalive_mode = KeepAliveMode::ServerboundInt32;
         let mut session = PlayerSession::new(config);
         let mut input = encoded_handshake("Luxorium");
         input.extend(encoded_login("Luxorium"));
@@ -3953,7 +4724,7 @@ mod tests {
                 panic!("unexpected packet id {packet_id:#04x}");
             }
         }
-        assert_eq!(14, chunk_visibility_frames);
+        assert_eq!(19, chunk_visibility_frames);
         assert_eq!(14, chunk_data_frames);
     }
 
@@ -4002,9 +4773,9 @@ mod tests {
     fn chunks_in_radius_handles_radius_zero_one_and_negative_centers() {
         assert_eq!(
             vec![ChunkPos::new(0, 0)],
-            chunks_in_radius(ChunkPos::new(0, 0), 0)
+            aurelia_common::chunks_in_radius(ChunkPos::new(0, 0), 0)
         );
-        let chunks = chunks_in_radius(ChunkPos::new(-1, 2), 1);
+        let chunks = aurelia_common::chunks_in_radius(ChunkPos::new(-1, 2), 1);
 
         assert_eq!(9, chunks.len());
         assert!(chunks.contains(&ChunkPos::new(-2, 1)));
@@ -4183,6 +4954,100 @@ mod tests {
         assert_eq!(SessionExit::ClientClosed, outcome);
         let (_, chunk_data_frames) = count_chunk_frames(&stream.written);
         assert_eq!(9, chunk_data_frames);
+        let visibility = chunk_visibility_packets(&stream.written);
+        assert_eq!(9, visibility.len());
+        assert!(visibility.iter().all(|packet| packet.load));
+    }
+
+    #[test]
+    fn movement_across_chunk_boundary_sends_new_chunks_and_unloads_old_chunks() {
+        let mut session = PlayerSession::new(playable_config(1));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player_position_look(
+            16.5, 66.0, 67.62, 0.5, 0.0, 0.0, true,
+        ));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        let visibility = chunk_visibility_packets(&stream.written);
+        let loads = visibility
+            .iter()
+            .filter(|packet| packet.load)
+            .cloned()
+            .collect::<Vec<_>>();
+        let unloads = visibility
+            .iter()
+            .filter(|packet| !packet.load)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(12, loads.len());
+        assert!(loads.contains(&ClientboundChunkVisibilityPacket::load(2, -1)));
+        assert!(loads.contains(&ClientboundChunkVisibilityPacket::load(2, 0)));
+        assert!(loads.contains(&ClientboundChunkVisibilityPacket::load(2, 1)));
+        assert_eq!(
+            vec![
+                ClientboundChunkVisibilityPacket::unload(-1, -1),
+                ClientboundChunkVisibilityPacket::unload(-1, 0),
+                ClientboundChunkVisibilityPacket::unload(-1, 1),
+            ],
+            unloads
+        );
+        let (_, chunk_data_frames) = count_chunk_frames(&stream.written);
+        assert_eq!(12, chunk_data_frames);
+    }
+
+    #[test]
+    fn unload_packets_are_not_duplicated_after_boundary_crossing() {
+        let mut session = PlayerSession::new(playable_config(1));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player_position_look(
+            16.5, 66.0, 67.62, 0.5, 0.0, 0.0, true,
+        ));
+        input.extend(encoded_player_position_look(
+            17.5, 66.0, 67.62, 1.5, 0.0, 0.0, true,
+        ));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        let unloads = chunk_visibility_packets(&stream.written)
+            .into_iter()
+            .filter(|packet| !packet.load)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![
+                ClientboundChunkVisibilityPacket::unload(-1, -1),
+                ClientboundChunkVisibilityPacket::unload(-1, 0),
+                ClientboundChunkVisibilityPacket::unload(-1, 1),
+            ],
+            unloads
+        );
+    }
+
+    #[test]
+    fn no_unload_packet_sent_for_chunks_still_in_range() {
+        let mut session = PlayerSession::new(playable_config(1));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player_position_look(
+            16.5, 66.0, 67.62, 0.5, 0.0, 0.0, true,
+        ));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        let unloads = chunk_visibility_packets(&stream.written)
+            .into_iter()
+            .filter(|packet| !packet.load)
+            .collect::<Vec<_>>();
+        assert!(!unloads.contains(&ClientboundChunkVisibilityPacket::unload(0, 0)));
+        assert!(!unloads.contains(&ClientboundChunkVisibilityPacket::unload(1, 0)));
     }
 
     #[test]
@@ -4296,7 +5161,9 @@ mod tests {
 
     #[test]
     fn keepalive_is_drained_without_disconnect() {
-        let mut session = PlayerSession::new(playable_config(0));
+        let mut config = playable_config(0);
+        config.keepalive_mode = KeepAliveMode::ServerboundInt32;
+        let mut session = PlayerSession::new(config);
         let mut input = encoded_handshake("Luxorium");
         input.extend(encoded_login("Luxorium"));
         input.extend(encoded_keepalive(42));
@@ -4308,6 +5175,60 @@ mod tests {
         assert_eq!(SessionExit::ClientClosed, outcome);
         assert_eq!(ConnectionState::Joined, session.state());
         assert!(session.player().unwrap().on_ground);
+    }
+
+    #[test]
+    fn default_keepalive_mode_does_not_consume_following_player_packets() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.push(KeepAlivePacket::ID);
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        assert!(session.player().unwrap().on_ground);
+        assert_eq!(1, session.joined_ready_movement_packets);
+        assert_eq!(
+            Some(KeepAliveReceive {
+                id: None,
+                raw: [0; 4],
+                raw_len: 0,
+                matched_expected: true,
+                likely_packet_bytes: false,
+            }),
+            session.last_keepalive_received
+        );
+    }
+
+    #[test]
+    fn int32_keepalive_diagnostics_flags_repeated_player_bytes() {
+        let mut config = playable_config(0);
+        config.keepalive_mode = KeepAliveMode::ServerboundInt32;
+        let mut session = PlayerSession::new(config);
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.push(KeepAlivePacket::ID);
+        input.extend([0x0A, 0x01, 0x0A, 0x01]);
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(
+            Some(KeepAliveReceive {
+                id: Some(167840257),
+                raw: [0x0A, 0x01, 0x0A, 0x01],
+                raw_len: 4,
+                matched_expected: false,
+                likely_packet_bytes: true,
+            }),
+            session.last_keepalive_received
+        );
     }
 
     #[test]
@@ -4346,6 +5267,203 @@ mod tests {
     }
 
     #[test]
+    fn dirt_drops_dirt() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 2,
+                    x: 0,
+                    y: 62,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 1,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[9]
+        );
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 62, 0))
+        );
+        assert!(
+            block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
+                x: 0,
+                y: 62,
+                z: 0,
+                block_type: 0,
+                metadata: 0,
+            })
+        );
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 36
+                && packet.slot_data == stack(3, 64, 0)));
+    }
+
+    #[test]
+    fn stone_without_pickaxe_does_not_produce_cobblestone() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        {
+            let player = session.player.as_mut().unwrap();
+            player.y = 60.0;
+            player.stance = 61.62;
+        }
+        let before = inventory_count(session.player().unwrap(), 4);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 2,
+                    x: 0,
+                    y: 58,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(before, inventory_count(session.player().unwrap(), 4));
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 58, 0))
+        );
+    }
+
+    #[test]
+    fn stone_with_pickaxe_produces_cobblestone() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        {
+            let player = session.player.as_mut().unwrap();
+            player.y = 60.0;
+            player.stance = 61.62;
+        }
+        session.player.as_mut().unwrap().set_hotbar_slot(4);
+        let before = inventory_count(session.player().unwrap(), 4);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 2,
+                    x: 0,
+                    y: 58,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(before + 1, inventory_count(session.player().unwrap(), 4));
+    }
+
+    #[test]
+    fn glass_drops_nothing() {
+        let state = GameServerState::shared_flat();
+        state.lock().unwrap().set_block(0, 63, 0, 20, 0);
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 2,
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(0, inventory_count(session.player().unwrap(), 20));
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
+        );
+    }
+
+    #[test]
+    fn breaking_air_does_not_create_items() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let before = session.player().unwrap().inventory.slots().to_vec();
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 2,
+                    x: 0,
+                    y: 64,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(before, session.player().unwrap().inventory.slots());
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+    }
+
+    #[test]
+    fn full_inventory_does_not_duplicate_break_drops() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        for slot in 9..PlayerInventory::WINDOW_SLOT_COUNT as i16 {
+            session
+                .player
+                .as_mut()
+                .unwrap()
+                .inventory
+                .set_slot(slot, stack(3, 64, 0));
+        }
+        let before = inventory_count(session.player().unwrap(), 3);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 2,
+                    x: 0,
+                    y: 62,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(before, inventory_count(session.player().unwrap(), 3));
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 62, 0))
+        );
+    }
+
+    #[test]
     fn player_digging_start_and_cancel_do_not_mutate_block() {
         let state = GameServerState::shared_flat();
         let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
@@ -4362,7 +5480,130 @@ mod tests {
             BlockState::GRASS,
             state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
         );
-        assert!(block_changes(&stream.written).is_empty());
+        assert_eq!(None, session.active_digging);
+    }
+
+    #[test]
+    fn player_digging_first_start_creates_active_dig() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 0,
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        let active = session.active_digging.expect("active dig");
+        assert_eq!(BlockPos::new(0, 63, 0), active.target);
+        assert_eq!(1, active.progress);
+        assert_eq!(BlockState::GRASS, active.block_at_start);
+    }
+
+    #[test]
+    fn player_digging_repeated_start_progresses_same_target() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        for _ in 0..2 {
+            session
+                .handle_player_digging(
+                    ServerboundPlayerDiggingPacket {
+                        status: 0,
+                        x: 0,
+                        y: 63,
+                        z: 0,
+                        face: 1,
+                    },
+                    &mut stream,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(2, session.active_digging.unwrap().progress);
+    }
+
+    #[test]
+    fn player_digging_changing_target_resets_active_dig() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 0,
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 0,
+                    x: 1,
+                    y: 63,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        let active = session.active_digging.unwrap();
+        assert_eq!(BlockPos::new(1, 63, 0), active.target);
+        assert_eq!(1, active.progress);
+    }
+
+    #[test]
+    fn player_digging_cancel_clears_active_dig() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 0,
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+        session
+            .handle_player_digging(
+                ServerboundPlayerDiggingPacket {
+                    status: 1,
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    face: 1,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(None, session.active_digging);
+        assert_eq!(
+            BlockState::GRASS,
+            state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
+        );
     }
 
     #[test]
@@ -4515,6 +5756,16 @@ mod tests {
             block_type: 2,
             metadata: 0,
         }));
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 39
+                && packet.slot_data
+                    == LegacySlotData::Present {
+                        item_id: 50,
+                        count: 64,
+                        damage: 0,
+                    }));
     }
 
     #[test]
@@ -4548,6 +5799,16 @@ mod tests {
             BlockState::AIR,
             state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
         );
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 40
+                && packet.slot_data
+                    == LegacySlotData::Present {
+                        item_id: 270,
+                        count: 1,
+                        damage: 0,
+                    }));
     }
 
     #[test]
@@ -4562,6 +5823,9 @@ mod tests {
 
         assert_eq!(SessionExit::ClientClosed, outcome);
         assert!(block_changes(&stream.written).is_empty());
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0 && packet.slot == 36));
         assert_eq!(
             LegacySlotData::Present {
                 item_id: 3,
@@ -4569,6 +5833,178 @@ mod tests {
                 damage: 0,
             },
             session.player().unwrap().inventory.slots()[36]
+        );
+    }
+
+    #[test]
+    fn placing_with_empty_hand_fails_without_consuming() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        session
+            .player
+            .as_mut()
+            .unwrap()
+            .inventory
+            .set_slot(36, LegacySlotData::Empty);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: LegacySlotData::Empty,
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 36
+                && packet.slot_data == LegacySlotData::Empty));
+    }
+
+    #[test]
+    fn placing_non_placeable_item_fails_without_consuming() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        session
+            .player
+            .as_mut()
+            .unwrap()
+            .inventory
+            .set_slot(36, stack(280, 5, 0));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: stack(280, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            stack(280, 5, 0),
+            session.player().unwrap().inventory.slots()[36]
+        );
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 36
+                && packet.slot_data == stack(280, 5, 0)));
+    }
+
+    #[test]
+    fn placing_outside_loaded_chunk_fails_without_consuming() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 16,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: stack(3, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 64,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[36]
+        );
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(16, 64, 0))
+        );
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 36
+                && packet.slot_data
+                    == LegacySlotData::Present {
+                        item_id: 3,
+                        count: 64,
+                        damage: 0,
+                    }));
+    }
+
+    #[test]
+    fn invalid_placement_face_sends_set_slot_correction() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    direction: 9,
+                    held_item: stack(3, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 36
+                && packet.slot_data == stack(3, 64, 0)));
+    }
+
+    #[test]
+    fn accepted_placement_marks_chunk_dirty() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        let before = state.lock().unwrap().dirty_chunk_count();
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: stack(3, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert!(state.lock().unwrap().dirty_chunk_count() > before);
+        assert_eq!(
+            BlockState::DIRT,
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
         );
     }
 
@@ -4667,6 +6103,76 @@ mod tests {
         tick_loop.stop().unwrap();
 
         assert!(state.lock().unwrap().world_time() > 0);
+    }
+
+    #[test]
+    fn player_health_damage_death_and_respawn_foundation() {
+        let mut player = PlayerState::new("Luxorium", EntityId::new(1));
+
+        assert_eq!(20, player.health);
+        assert_eq!(PlayerLifeState::Alive, player.life_state);
+
+        player.apply_damage(7);
+        assert_eq!(13, player.health);
+        assert_eq!(PlayerLifeState::Alive, player.life_state);
+
+        player.apply_damage(99);
+        assert_eq!(0, player.health);
+        assert_eq!(PlayerLifeState::Dead, player.life_state);
+
+        player.respawn_at_spawn();
+        assert_eq!(20, player.health);
+        assert_eq!(PlayerLifeState::Alive, player.life_state);
+        assert_eq!(0.5, player.x);
+        assert_eq!(66.0, player.y);
+    }
+
+    #[test]
+    fn void_movement_damage_can_kill_player() {
+        let mut player = PlayerState::new("Luxorium", EntityId::new(1));
+        for _ in 0..5 {
+            player.apply_movement(ServerboundMovementPacket::PlayerPosition {
+                x: 0.5,
+                y: -65.0,
+                stance: -63.38,
+                z: 0.5,
+                on_ground: false,
+            });
+        }
+
+        assert_eq!(0, player.health);
+        assert_eq!(PlayerLifeState::Dead, player.life_state);
+    }
+
+    #[test]
+    fn player_state_saves_and_loads_inventory_health_and_position() {
+        let dir = test_server_world_dir("player-state");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = GameServerState::new_flat_persistent(world_save_dir_for_test(&dir)).unwrap();
+        let mut player = PlayerState::new("Luxorium", EntityId::new(1));
+        player.x = 12.5;
+        player.y = 70.0;
+        player.stance = 71.62;
+        player.z = -3.5;
+        player.yaw = 90.0;
+        player.pitch = 10.0;
+        player.health = 6;
+        player.inventory.set_slot(36, stack(4, 12, 0));
+
+        state.save_player_state(&player).unwrap();
+        let loaded = state
+            .load_player_state("Luxorium", EntityId::new(2))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!("Luxorium", loaded.username);
+        assert_eq!(EntityId::new(2), loaded.entity_id);
+        assert_eq!(12.5, loaded.x);
+        assert_eq!(-3.5, loaded.z);
+        assert_eq!(90.0, loaded.yaw);
+        assert_eq!(6, loaded.health);
+        assert_eq!(stack(4, 12, 0), loaded.inventory.slots()[36]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4778,6 +6284,47 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn ready_session_with_state(state: SharedGameServerState) -> PlayerSession {
+        let entity_id = {
+            let mut state_guard = state.lock().unwrap();
+            state_guard.ensure_chunk_loaded(ChunkPos::new(0, 0));
+            state_guard.register_player("Luxorium")
+        };
+        let mut session = PlayerSession::with_state(playable_config(0), state);
+        session.state = ConnectionState::Joined;
+        session.join_phase = JoinPhase::JoinedReady;
+        session.registered_username = Some("Luxorium".to_string());
+        session.player = Some(PlayerState::new("Luxorium", entity_id));
+        session
+            .chunk_view
+            .update(ChunkPos::new(0, 0), session.chunk_radius());
+        session
+    }
+
+    fn inventory_count(player: &PlayerState, item_id: i16) -> u32 {
+        player
+            .inventory
+            .slots()
+            .iter()
+            .filter_map(|slot| match slot {
+                LegacySlotData::Present {
+                    item_id: slot_item,
+                    count,
+                    ..
+                } if *slot_item == item_id => Some(u32::from(*count)),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn test_server_world_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aurelia-server-test-{name}-{}", std::process::id()))
+    }
+
+    fn world_save_dir_for_test(dir: &Path) -> PathBuf {
+        dir.join("aurelia-flat-v1")
     }
 
     fn encoded_handshake(username: &str) -> Vec<u8> {
@@ -5043,6 +6590,52 @@ mod tests {
             }
         }
         (visibility, data)
+    }
+
+    fn chunk_visibility_packets(bytes: &[u8]) -> Vec<ClientboundChunkVisibilityPacket> {
+        let mut output = bytes;
+        let mut packets = Vec::new();
+        while !output.is_empty() {
+            match output[0] {
+                ClientboundChunkVisibilityPacket::ID => {
+                    let payload = &output[1..10];
+                    packets.push(ClientboundChunkVisibilityPacket {
+                        chunk_x: i32::from_be_bytes(payload[0..4].try_into().unwrap()),
+                        chunk_z: i32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                        load: payload[8] != 0,
+                    });
+                    output = &output[10..];
+                }
+                ClientboundChunkDataPacket::ID => {
+                    output = skip_chunk_data_frame(output);
+                }
+                ClientboundSetWindowItemsPacket::ID
+                | ClientboundSetSlotPacket::ID
+                | ClientboundBeta173TimeUpdatePacket::ID
+                | ChatPacket::ID
+                | KeepAlivePacket::ID
+                | ClientboundConfirmTransactionPacket::ID => {
+                    output = skip_known_clientbound_frame(output).unwrap();
+                }
+                HandshakePacket::ID => {
+                    output = &output[1 + 4..];
+                }
+                ClientboundLoginResponsePacket::ID => {
+                    output = &output[1 + 15..];
+                }
+                ClientboundSpawnPositionPacket::ID => {
+                    output = &output[1 + 12..];
+                }
+                ClientboundPlayerPositionLookPacket::ID => {
+                    output = &output[1 + 41..];
+                }
+                ClientboundBlockChangePacket::ID => {
+                    output = &output[1 + 15..];
+                }
+                packet_id => panic!("unexpected packet id {packet_id:#04x}"),
+            }
+        }
+        packets
     }
 
     fn block_changes(bytes: &[u8]) -> Vec<ClientboundBlockChangePacket> {

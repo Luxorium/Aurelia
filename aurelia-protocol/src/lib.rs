@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -46,7 +46,7 @@ impl From<io::Error> for ProtocolError {
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PacketDirection {
     ClientToServer,
     ServerToClient,
@@ -155,29 +155,209 @@ pub trait PacketCodec<P> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketMetadata {
+    pub direction: PacketDirection,
+    pub packet_id: u8,
+    pub name: &'static str,
+}
+
+impl PacketMetadata {
+    pub const fn new(direction: PacketDirection, packet_id: u8, name: &'static str) -> Self {
+        Self {
+            direction,
+            packet_id,
+            name,
+        }
+    }
+}
+
 pub struct PacketCodecRegistry {
-    packet_ids: HashSet<u8>,
+    packets: HashMap<(PacketDirection, u8), PacketMetadata>,
 }
 
 impl PacketCodecRegistry {
     pub fn beta173_defaults() -> Self {
-        Self {
-            packet_ids: [
-                HandshakePacket::ID,
-                ServerboundLoginPacket::ID,
-                DisconnectPacket::ID,
-            ]
-            .into_iter()
-            .collect(),
-        }
+        let mut registry = Self {
+            packets: HashMap::new(),
+        };
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            KeepAlivePacket::ID,
+            "KeepAlive",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundLoginPacket::ID,
+            "Login",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            HandshakePacket::ID,
+            "Handshake",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ChatPacket::ID,
+            "Chat",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            0x0A,
+            "Player",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            0x0B,
+            "PlayerPosition",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            0x0C,
+            "PlayerLook",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            0x0D,
+            "PlayerPositionLook",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundPlayerDiggingPacket::ID,
+            "PlayerDigging",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundPlayerBlockPlacementPacket::ID,
+            "PlayerBlockPlacement",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundHeldItemChangePacket::ID,
+            "HeldItemChange",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundAnimationPacket::ID,
+            "Animation",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundEntityActionPacket::ID,
+            "EntityAction",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundCloseWindowPacket::ID,
+            "CloseWindow",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundWindowClickPacket::ID,
+            "WindowClick",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            ServerboundConfirmTransactionPacket::ID,
+            "ConfirmTransaction",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ClientToServer,
+            DisconnectPacket::ID,
+            "Disconnect",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            KeepAlivePacket::ID,
+            "KeepAlive",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundLoginResponsePacket::ID,
+            "LoginResponse",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ChatPacket::ID,
+            "Chat",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundBeta173TimeUpdatePacket::ID,
+            "TimeUpdate",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundSpawnPositionPacket::ID,
+            "SpawnPosition",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundPlayerPositionLookPacket::ID,
+            "PlayerPositionLook",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundChunkVisibilityPacket::ID,
+            "SetChunkVisibility",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundChunkDataPacket::ID,
+            "ChunkData",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundBlockChangePacket::ID,
+            "BlockChange",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundSetSlotPacket::ID,
+            "SetSlot",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundSetWindowItemsPacket::ID,
+            "SetWindowItems",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            ClientboundConfirmTransactionPacket::ID,
+            "ConfirmTransaction",
+        ));
+        registry.register(PacketMetadata::new(
+            PacketDirection::ServerToClient,
+            DisconnectPacket::ID,
+            "Disconnect",
+        ));
+        registry
+    }
+
+    pub fn register(&mut self, metadata: PacketMetadata) {
+        self.packets
+            .insert((metadata.direction, metadata.packet_id), metadata);
     }
 
     pub fn contains(&self, packet_id: u8) -> bool {
-        self.packet_ids.contains(&packet_id)
+        self.contains_direction(PacketDirection::ClientToServer, packet_id)
+    }
+
+    pub fn contains_direction(&self, direction: PacketDirection, packet_id: u8) -> bool {
+        self.packets.contains_key(&(direction, packet_id))
     }
 
     pub fn find(&self, packet_id: u8) -> Option<u8> {
         self.contains(packet_id).then_some(packet_id)
+    }
+
+    pub fn metadata(&self, direction: PacketDirection, packet_id: u8) -> Option<PacketMetadata> {
+        self.packets.get(&(direction, packet_id)).copied()
+    }
+
+    pub fn packet_name(&self, direction: PacketDirection, packet_id: u8) -> Option<&'static str> {
+        self.metadata(direction, packet_id)
+            .map(|metadata| metadata.name)
     }
 }
 
@@ -546,6 +726,14 @@ impl ClientboundChunkVisibilityPacket {
             chunk_x,
             chunk_z,
             load: true,
+        }
+    }
+
+    pub const fn unload(chunk_x: i32, chunk_z: i32) -> Self {
+        Self {
+            chunk_x,
+            chunk_z,
+            load: false,
         }
     }
 }
@@ -1019,6 +1207,8 @@ pub struct ServerboundPlayerDiggingPacket {
 
 impl ServerboundPlayerDiggingPacket {
     pub const ID: u8 = 0x0E;
+    pub const START_DIGGING_STATUS: i8 = 0;
+    pub const CANCEL_DIGGING_STATUS: i8 = 1;
     pub const FINISHED_DIGGING_STATUS: i8 = 2;
 
     pub fn decode(input: &mut impl Read) -> Result<Self> {
@@ -1559,6 +1749,50 @@ mod tests {
     }
 
     #[test]
+    fn registry_names_login_by_direction() {
+        let registry = PacketCodecRegistry::beta173_defaults();
+
+        assert_eq!(
+            Some("Login"),
+            registry.packet_name(PacketDirection::ClientToServer, 0x01)
+        );
+        assert_eq!(
+            Some("LoginResponse"),
+            registry.packet_name(PacketDirection::ServerToClient, 0x01)
+        );
+        assert_eq!(
+            Some(PacketMetadata::new(
+                PacketDirection::ClientToServer,
+                0x01,
+                "Login"
+            )),
+            registry.metadata(PacketDirection::ClientToServer, 0x01)
+        );
+        assert_eq!(
+            Some(PacketMetadata::new(
+                PacketDirection::ServerToClient,
+                0x01,
+                "LoginResponse"
+            )),
+            registry.metadata(PacketDirection::ServerToClient, 0x01)
+        );
+    }
+
+    #[test]
+    fn registry_keeps_unknown_packets_unknown_by_direction() {
+        let registry = PacketCodecRegistry::beta173_defaults();
+
+        assert_eq!(
+            None,
+            registry.packet_name(PacketDirection::ClientToServer, 0x7E)
+        );
+        assert_eq!(
+            None,
+            registry.packet_name(PacketDirection::ServerToClient, 0x7E)
+        );
+    }
+
+    #[test]
     fn reports_known_movement_payload_lengths() {
         assert_eq!(Some(1), movement_payload_length(0x0A));
         assert_eq!(Some(33), movement_payload_length(0x0B));
@@ -2058,6 +2292,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vec![0, 0, 0, 0, 0, 0, 0, 0, 1], visibility);
+
+        let mut unload_visibility = Vec::new();
+        ClientboundChunkVisibilityPacketCodec::encode(
+            &ClientboundChunkVisibilityPacket::unload(-1, 2),
+            &mut unload_visibility,
+        )
+        .unwrap();
+        assert_eq!(
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 2, 0],
+            unload_visibility
+        );
     }
 
     #[test]

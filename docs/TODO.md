@@ -2,7 +2,7 @@
 
 ## Current Milestone
 
-0.1.3 - Survival Interaction Polish.
+0.2.0 - Vanilla Parity Foundation.
 
 The project base compiles and has Rust workspace scaffolding. A blocking TCP
 listener accepts clients and creates a long-lived `PlayerSession`. Shared game
@@ -11,10 +11,11 @@ counter. Normal mode still disconnects after handshake.
 `--experimental-join --playable-flat-world` can decode handshake/login, verify
 protocol version `14`, send provisional join packets and a flat spawn chunk
 area, wait for first client movement before post-join sync, stream missing
-chunks as the player moves between chunks, sync a starter hotbar,
-keepalive/time update the client, process chat/debug commands, handle basic
-inventory clicks, log placement/digging decisions with clear reasons, persist
-modified flat chunks, then cleanly handle client quit.
+chunks and unload out-of-range chunks as the player moves between chunks, sync
+a starter hotbar, keepalive/time update the client, process chat/debug
+commands, handle basic inventory clicks, log placement/digging decisions with
+clear reasons, apply early survival item/block rules, persist modified flat
+chunks and basic player state, then cleanly handle client quit.
 
 ## Completed This Run
 
@@ -85,14 +86,55 @@ modified flat chunks, then cleanly handle client quit.
 - Added WindowClick decision logs with accepted/rejected state and changed
   slots.
 - Added command bad-argument tests for short Beta-safe usage responses.
+- Added a reusable deterministic `ChunkView` abstraction with radius and diff
+  tests.
+- Added `S->C 0x32` chunk visibility unload support and movement-driven
+  unloads for chunks outside the configured radius.
+- Added direction-aware packet metadata so `C->S 0x01 Login` and
+  `S->C 0x01 LoginResponse` are named separately.
+- Added protocol/session regression tests for chunk visibility load/unload
+  encoding, chunk view diffs, movement-driven loads/unloads, no unloads for
+  chunks still in range, no duplicate unloads, and direction-aware packet
+  names.
+- Added `docs/VANILLA_PARITY_MATRIX.md` to track vanilla expectations,
+  Aurelia status, missing behavior, test strategy, and priority by system.
+- Added Beta 1.7.3 item rules for early survival stack limits, placeable
+  blocks, tool categories, and tool tiers.
+- Added Beta 1.7.3 block rules for early survival materials, approximate
+  hardness, preferred/required tools, solidity/transparency, light placeholders,
+  and drops.
+- Replaced simple break drops with rule-driven harvest behavior. Stone requires
+  a pickaxe for cobblestone, glass drops nothing, ore drops follow the current
+  rule table, and full inventories do not duplicate drops.
+- Tightened placement around valid selected inventory items, placeable item
+  rules, loaded chunks, reach, occupied solid targets, stack decrement, and
+  rejected-placement correction.
+- Added server-side player health/death state, fall/void damage foundation, and
+  a respawn helper. Client-visible health/death packets remain unverified.
+- Added Aurelia-native player persistence for username, position, rotation,
+  health, inventory, and spawn position. Vanilla NBT player save parity remains
+  incomplete.
 
 ## Next Recommended Tasks
 
-- Run the full manual 0.1.3 acceptance pass against a clean Beta 1.7.3 client:
-  join, walk for 60 seconds, wait for keepalive, chat commands, inventory
-  clicks, place/break, save, restart, and verify persisted edits.
+- Run the full manual 0.2.0 acceptance pass against a clean Beta 1.7.3 client:
+  - join with `--experimental-join --playable-flat-world`;
+  - walk around;
+  - cross chunk boundaries;
+  - break dirt, stone, glass, and ore blocks;
+  - verify drops and inventory behavior;
+  - place blocks from the hotbar;
+  - try placing invalid/non-placeable items;
+  - take damage;
+  - die if the current packet flow allows a stable client observation;
+  - respawn if a verified packet path is implemented;
+  - run `/save`;
+  - restart the server;
+  - verify position, inventory, and world edits persist;
+  - verify no client crash or disconnect.
 - Decide protocol-version mismatch behavior from clean observations.
-- Add direction-aware codec registries when clientbound codecs are introduced.
+- Expand direction-aware codec registries only when additional clientbound
+  codecs are introduced.
 - Validate `0x0E`, `0x0F`, `0x10`, `0x12`, `0x13`, and `0x35` behavior against
   a real Beta 1.7.3 client and adjust only from clean observations.
 - Validate `0x65`, `0x66`, and `0x6A` inventory/window behavior against a real
@@ -100,7 +142,7 @@ modified flat chunks, then cleanly handle client quit.
   expanding inventory state.
 - Add replaceable block/collision semantics for placement after current
   conservative placement stays stable in real-client traces.
-- Add item entities for inventory-full drops.
+- Add item entities for inventory-full drops and pickups.
 - Add crafting/workbench/chest/smelting UI support.
 
 ## Known Blockers
@@ -114,19 +156,23 @@ modified flat chunks, then cleanly handle client quit.
   movement. Shift-click, crafting, armor semantics, workbench, chests, and
   smelting are not implemented.
 - Item entities are not implemented; inventory-full drops are ignored.
-- Real health, damage, death, respawn, and combat are not implemented.
+- Health/death/respawn is server-side only; client-visible packets still need
+  clean verification before use.
+- Damage sources beyond fall/void placeholders and combat are not implemented.
 - The `beta173-observed` login response is only provisionally accepted; it is
   not yet a supported compatibility claim.
 - The `mcdevs-legacy` response reset/disconnected the latest tested client.
 - The Beta-format experimental chunk shape works in the latest manual trace but
   still needs longer compatibility testing.
-- The default playable chunk radius sends a 3x3 area around spawn, but the
-  correct client-visible chunk strategy is still unverified.
+- The default playable chunk radius sends a 3x3 area around the current player
+  chunk and unloads chunks outside that radius, but the correct production
+  client-visible chunk strategy is still unverified.
 - The `unusedOrSeed` field name is intentionally conservative until its exact
   semantics are verified.
-- The current codec registry is serverbound-only in practice; clientbound
-  registry design is intentionally deferred.
-- Persistence is Aurelia-native and limited to modified flat-world chunks.
+- Packet metadata is direction-aware for known MVP packets, but full
+  clientbound codec registry design is intentionally deferred.
+- Persistence is Aurelia-native for modified flat-world chunks and basic player
+  data; it is not vanilla McRegion/NBT.
 
 ## Testing Notes
 

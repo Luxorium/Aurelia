@@ -179,13 +179,14 @@ client rejects the packet or traces show another order.
 ### Experimental Clientbound Chunk Data
 
 `S->C 0x32 SetChunkVisibility` and `S->C 0x33 ChunkData` are sent only in
-`--experimental-join`.
+`--experimental-join` / `--playable-flat-world` compatibility paths.
 
 `S->C 0x32 SetChunkVisibility` writes:
 
 - `int chunkX`.
 - `int chunkZ`.
-- `boolean load`.
+- `boolean load`; `true` marks a chunk visible before data, and `false`
+  unloads a chunk that left the configured view radius.
 
 `S->C 0x33 ChunkData` uses the Beta block-region shape:
 
@@ -198,10 +199,12 @@ client rejects the packet or traces show another order.
 - `int compressedSize`.
 - `byte[] compressedData`.
 
-Current first attempt:
+Current conservative send:
 
-- Sends `0x32` for chunk `(0,0)` with `load = true`.
-- Sends `0x33` for block region `x = 0`, `y = 0`, `z = 0`.
+- Sends `0x32` with `load = true` before each newly visible chunk.
+- Sends `0x32` with `load = false` when a previously visible chunk leaves the
+  configured radius.
+- Sends `0x33` for each newly visible block region.
 - Sets `widthMinusOne = 15`, `heightMinusOne = 127`, `lengthMinusOne = 15`.
 - Raw compressed data is a full 16x128x16 region:
   - Blocks: 32768 bytes.
@@ -237,15 +240,12 @@ continues to show no terrain.
 
 ## Codec Registry
 
-`PacketCodecRegistry::beta173_defaults()` currently maps:
+`PacketCodecRegistry::beta173_defaults()` currently stores direction-aware
+packet metadata for known MVP packet IDs. Shared IDs are named by direction;
+for example, `C->S 0x01` is `Login` and `S->C 0x01` is `LoginResponse`.
 
-- `0x02` to `HandshakePacketCodec`.
-- `0x01` to `ServerboundLoginPacketCodec`.
-- `0xFF` to `DisconnectPacketCodec`.
-
-Unknown packet IDs return an empty lookup. The registry is currently for
-serverbound dispatch only; direction-aware registries should be added when
-clientbound packet codecs are implemented.
+Unknown packet IDs return an empty lookup. Aurelia does not infer unknown
+payload lengths for undocumented packets.
 
 ## Session Loop
 
@@ -292,16 +292,19 @@ With `--experimental-join`, the listener instead attempts:
     `S->C 0x68` starter inventory/window items.
 
 With `--playable-flat-world`, the initial chunk radius defaults to `1`, sending
-the spawn chunk and its eight neighbors. Use `--chunk-radius 0` to send only
-chunk `(0,0)`.
+the spawn chunk and its eight neighbors. As the player crosses chunk
+boundaries, Aurelia sends newly required chunks and unloads chunks outside the
+configured radius. Use `--chunk-radius 0` to send only the player's current
+chunk.
 
-`--no-inventory-sync`, `--no-time-update`, and `--no-keepalive` disable only the
-newer clientbound survival-session features for compatibility testing.
-`--defer-inventory-sync` keeps starter inventory delayed until after several
-post-join movements; this is currently the default. `--post-join-minimal`
-suppresses TimeUpdate, inventory sync, SetSlot, ConfirmTransaction, chat
-responses, and KeepAlive scheduling. These flags do not disable chunk
-streaming, break/place, or server-side inventory state.
+`--no-inventory-sync`, `--no-time-update`, `--time-update-mode
+off|once|interval`, `--no-keepalive`, and `--keepalive-mode
+off|serverbound-no-payload|serverbound-int32` control narrow compatibility
+surfaces for testing. `--defer-inventory-sync` keeps starter inventory delayed
+until after several post-join movements; this is currently the default.
+`--post-join-minimal` suppresses TimeUpdate, inventory sync, SetSlot,
+ConfirmTransaction, chat responses, and KeepAlive scheduling. These flags do
+not disable chunk streaming, break/place, or server-side inventory state.
 
 ### Clientbound `0x04` TimeUpdate
 
@@ -337,12 +340,15 @@ The joined loop currently handles:
 - `C->S 0xFF Disconnect`.
 
 Movement packets update the server-side player position, look, on-ground flag,
-and current chunk. KeepAlive responses are accepted leniently. Chat is echoed
-or handled as short debug commands. Interaction packets are applied
+and current chunk. KeepAlive responses are accepted through the configured
+compatibility mode; the default does not consume serverbound payload bytes.
+Chat is echoed or handled as short debug commands. Interaction packets are applied
 conservatively: animation is ignored, entity action tracks crouch where
 possible, held item change stores hotbar indices `0..=8`, digging status `2`
-breaks reachable visible non-bedrock blocks and adds simple drops, and
-placement uses the selected server-side hotbar stack. Window clicks handle
+breaks reachable visible non-bedrock blocks and applies rule-driven harvest
+drops, and placement uses the selected server-side hotbar stack. Server-side
+health/death state, fall damage, void damage, and a respawn helper exist, but
+Aurelia does not yet send unverified health/death/respawn packets. Window clicks handle
 basic left/right pick-up and place behavior for window `0`; unsupported click
 modes are rejected with transaction failure plus inventory resync instead of
 disconnecting.
@@ -369,15 +375,19 @@ trace/compat debug and does not mutate world state or decrement inventory.
 Normal placement is accepted only when the selected stack is a placeable block,
 the target is valid, loaded, in reach, and currently air, and the clicked block
 still exists. Rejections send corrective `0x35 BlockChange` packets for the
-clicked and target positions where applicable. Current rejection reasons are
-`no-selected-item`, `selected-not-placeable`, `target-unloaded`,
+clicked and target positions where applicable, then send `0x67 SetSlot` for the
+selected hotbar/window slot when inventory sync is enabled. Current rejection
+reasons are `no-selected-item`, `selected-not-placeable`, `target-unloaded`,
 `target-invalid-y`, `target-not-air`, `clicked-block-missing`, and
 `out-of-reach`.
 
 Digging status names used by logs are `start`, `cancel`, `finish`,
-`drop-stack`, `drop-item`, and `use-finish`. Only `finish` mutates blocks.
-Bedrock is protected, and simple drops are added to inventory only after a
-successful finish.
+`drop-stack`, `drop-item`, and `use-finish`. `start` creates or progresses an
+active digging state, repeated starts on the same target are progress, target
+changes reset tracking, and `cancel` clears tracking. Only valid completion
+mutates blocks. Bedrock is protected, and rule-driven drops are added to
+inventory only after a successful finish. Capture clean Beta 1.7.3 traces
+before adding clientbound health/death/respawn packet writes.
 
 ## Packet Trace Mode
 
@@ -401,7 +411,9 @@ Experimental post-login tracing reads known C->S movement packets with fixed
 payload sizes, plus documented fixed interaction packets:
 
 - `0x0A Player`: 1 byte.
-- `0x00 KeepAlive`: 4 bytes.
+- `0x00 KeepAlive`: controlled by `--keepalive-mode`; default
+  `serverbound-no-payload` consumes no payload, `serverbound-int32` consumes 4
+  bytes for trace comparison only.
 - `0x0B PlayerPosition`: 33 bytes.
 - `0x0C PlayerLook`: 9 bytes.
 - `0x0D PlayerPositionLook`: 41 bytes.

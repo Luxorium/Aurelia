@@ -1,0 +1,31 @@
+# Vanilla Parity Matrix
+
+This matrix tracks Aurelia against vanilla Minecraft Beta 1.7.3 behavior from
+the client/player point of view. It is a clean-room planning document, not a
+compatibility claim. Approximate values are isolated in code and should be
+corrected only from public documentation, packet traces, or black-box testing.
+
+| Area | Vanilla expectation | Aurelia current status | Missing behavior | Test strategy | Priority |
+| --- | --- | --- | --- | --- | --- |
+| Protocol/login/play state | Beta 1.7.3 protocol 14 login, play packets, disconnects, keepalive, and known packet layouts work directionally. | Experimental join accepts a real client, sends provisional login/spawn/chunks/time/inventory, traces direction-aware names. | Full packet map, verified health/death/respawn packets, many entity/window packets. | Unit packet tests plus clean client/server traces. | High |
+| World/chunk format | Vanilla McRegion/NBT-compatible world and player data. | Aurelia-native flat chunk and player files. | McRegion, NBT, vanilla level/player data. | File round-trip tests and black-box import/export checks later. | High |
+| Terrain generation | Vanilla Beta terrain, caves, ores, trees, structures where applicable. | Flat world only. | Full terrain generator and biome behavior. | Golden clean-room terrain fixtures and real-world comparisons. | Medium |
+| Blocks and materials | All Beta blocks have correct material, hardness, opacity, light, drops, and interactions. | Early survival block table exists for stone/grass/dirt/cobble/wood/planks/leaves/sand/gravel/glass/ores/torch/table/furnace/chest. Values are partly approximate. | Most blocks, exact values, replaceable/collision/liquid/redstone behavior. | Rule-table unit tests plus client interaction traces. | High |
+| Items and stack sizes | All item IDs, stack limits, tools, food, durability, and use behavior match vanilla. | Early item/tool table exists with stack limits and tool categories. | Most items, durability loss, food/use effects. | Rule-table tests and inventory interaction tests. | High |
+| Inventory | Player inventory, hotbar, cursor, click semantics, stack merging, armor/crafting slots. | Conservative window 0 inventory, hotbar mapping, basic left/right clicks, rule-based stack caps. | Shift-click, crafting grid, armor, full vanilla transaction behavior. | Unit tests plus real-client click traces. | High |
+| Crafting | 2x2 and workbench recipes and output behavior. | Not implemented. | Recipe book, grid behavior, workbench UI. | Recipe fixtures and window packet traces. | Medium |
+| Smelting/furnaces | Furnace block entity, fuel, cook time, UI. | Furnace block can be placed as a normal block placeholder. | Tile entity, UI, fuel/cooking logic. | Future tile-entity tests and client traces. | Medium |
+| Containers | Chest/furnace/workbench/dispenser-style windows. | Chest can be placed as a placeholder block only. | Container storage, open/close windows, sync. | Window packet tests. | Medium |
+| Player movement | Vanilla movement validation, stance, collision, fall tracking. | Server tracks position/look/chunk and applies simple fall/void damage. | Collision, anti-cheat tolerances, riding/sneak edge cases. | Movement packet unit tests and black-box traces. | High |
+| Player health/death/respawn | Health starts at 20, damage/death/respawn sync with client. | Server-side health, alive/dead state, respawn helper, fall/void damage foundation. | Verified health/death/respawn packets and client UI sync. | Unit tests now; packet traces before clientbound health/death writes. | High |
+| Damage sources | Fall, void, drowning, fire, lava, cactus, mobs, projectiles, explosions. | Fall and void placeholders only. | All other sources and armor rules. | Focused damage-source tests later. | Medium |
+| Block breaking | Reach, tool requirements, hardness timing, drops, corrections. | Reach checks, rule-driven harvest drops, no air/bedrock drops, inventory-full no duplication. | Timed digging, tool durability, exact harvest rules for all blocks. | Unit tests plus real-client block trace tests. | High |
+| Block placement | Valid inventory, placeable items, stack decrement, loaded chunk/reach/occupied checks. | Rule-driven placeable checks, stack decrement, loaded chunk and occupied-air checks. | Replaceables, collision, orientation, special use behavior. | Unit tests plus real-client traces. | High |
+| Drops/entities | Item entities spawn and merge, pickups, despawn. | Drops go directly into inventory if space exists; full inventory drops are not duplicated. | Item entity packets and pickup behavior. | Future entity tests and client traces. | High |
+| Mobs/passive animals | Passive spawn, AI, damage, drops. | Server-side entity ID scaffold only. | Visible spawn packets, AI, drops. | Entity packet and behavior tests later. | Low |
+| Hostile mobs | Hostile spawn, AI, damage, drops. | Not implemented. | All hostile behavior. | Future AI/entity tests. | Low |
+| Redstone | Power propagation, components, ticks. | Not implemented. | All redstone behavior. | Rule/tick fixtures later. | Low |
+| Fluids | Water/lava flow, source rules, interactions. | Not implemented beyond placeholder block IDs. | All fluid simulation. | Tick fixtures later. | Low |
+| Weather/time | Day time, weather state, sleep interactions. | World time counter and Beta one-long TimeUpdate. | Weather, sleep, exact time semantics. | Packet tests and client traces. | Medium |
+| Commands/operator behavior | Vanilla commands, permissions, ops, server.properties. | Aurelia debug commands only. | Vanilla command set and permission model. | Command tests later. | Low |
+| Persistence/save format | Vanilla McRegion/NBT world, player, inventory, tile entity saves. | Aurelia-native chunk and player formats. | Vanilla save parity. | Round-trip tests now; NBT/McRegion tests later. | High |
