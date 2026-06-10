@@ -1296,7 +1296,7 @@ impl PlayerInventory {
                     damage,
                 },
             ) => {
-                let taken = (count + 1) / 2;
+                let taken = count.div_ceil(2);
                 self.cursor = stack(item_id, taken, damage);
                 self.slots[slot] = if taken == count {
                     LegacySlotData::Empty

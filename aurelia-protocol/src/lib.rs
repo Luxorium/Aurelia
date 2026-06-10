@@ -841,8 +841,8 @@ pub mod experimental_flat_chunk_data {
         let mut bytes = Vec::with_capacity(UNCOMPRESSED_FULL_CHUNK_BYTES);
         bytes.extend_from_slice(block_ids);
         bytes.extend_from_slice(&pack_nibbles(metadata));
-        bytes.extend(std::iter::repeat(0).take(NIBBLE_ARRAY_BYTES));
-        bytes.extend(std::iter::repeat(0xFF).take(NIBBLE_ARRAY_BYTES));
+        bytes.extend(std::iter::repeat_n(0, NIBBLE_ARRAY_BYTES));
+        bytes.extend(std::iter::repeat_n(0xFF, NIBBLE_ARRAY_BYTES));
 
         ClientboundChunkDataPacket {
             x: chunk_x * WIDTH as i32,
@@ -867,9 +867,9 @@ pub mod experimental_flat_chunk_data {
         }
 
         bytes.extend_from_slice(&block_ids);
-        bytes.extend(std::iter::repeat(0).take(NIBBLE_ARRAY_BYTES));
-        bytes.extend(std::iter::repeat(0).take(NIBBLE_ARRAY_BYTES));
-        bytes.extend(std::iter::repeat(0xFF).take(NIBBLE_ARRAY_BYTES));
+        bytes.extend(std::iter::repeat_n(0, NIBBLE_ARRAY_BYTES));
+        bytes.extend(std::iter::repeat_n(0, NIBBLE_ARRAY_BYTES));
+        bytes.extend(std::iter::repeat_n(0xFF, NIBBLE_ARRAY_BYTES));
         bytes
     }
 
