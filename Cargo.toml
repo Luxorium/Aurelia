@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "aurelia-common",
+    "aurelia-protocol",
+    "aurelia-world",
+    "aurelia-region",
+    "aurelia-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+

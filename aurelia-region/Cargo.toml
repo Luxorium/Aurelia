@@ -1,0 +1,13 @@
+[package]
+name = "aurelia-region"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aurelia-common = { path = "../aurelia-common" }
+aurelia-world = { path = "../aurelia-world" }
+
+[lib]
+path = "src/lib.rs"
+
