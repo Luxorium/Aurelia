@@ -14,6 +14,51 @@ TODO:
 - Keep all compatibility claims clearly scoped.
 - Add focused tests for every new foundational type.
 
+## 0.1.2 - Stable Survival Session MVP
+
+- Real Beta 1.7.3 client can join the experimental flat-world path.
+- Chunk loading, movement, block breaking, block placement, crouch/entity
+  action, inventory open/close, many window clicks, and clean quit are stable in
+  the latest manual trace.
+- Starter hotbar sync through `0x68` SetWindowItems.
+- Initial world chunks are sent before starter inventory/time sync. Beta
+  TimeUpdate uses one `i64` after first movement, and inventory sync waits for
+  additional movement packets.
+- Inventory-backed placement and simple break drops.
+- Conservative window click handling with transaction confirmations and resync.
+- Chat/debug commands.
+- Periodic keepalive and Beta 1.7.3 one-long time update packets.
+- Compatibility toggles: `--no-inventory-sync`, `--no-time-update`,
+  `--no-keepalive`, `--defer-inventory-sync`, and `--post-join-minimal`.
+- Aurelia-native dirty chunk persistence for modified flat-world chunks.
+
+TODO:
+
+- Validate keepalive cadence and inventory transaction behavior over longer
+  real-client sessions.
+- Expand inventory rules only after preserving stream stability.
+- Keep persistence native until a separate vanilla-format milestone.
+
+## 0.1.3 - Survival Interaction Polish
+
+- Structured compat-debug logs for placement, item-use-in-air, digging,
+  held-item changes, window clicks, keepalive, and chat commands.
+- Explicit player inventory hotbar mapping: hotbar `0..=8` maps to window
+  slots `36..=44`.
+- Placement rejects with specific reasons and sends corrective block changes
+  for clicked/target blocks without decrementing inventory.
+- Special `0x0F` item-use-in-air packets are ignored safely.
+- Digging start/cancel/drop/use statuses do not mutate blocks; finish breaks
+  only reachable loaded non-bedrock blocks and logs drop inventory results.
+
+TODO:
+
+- Validate placement rejection reasons against longer real-client traces.
+- Add replaceable-block and collision semantics after packet stability remains
+  clean.
+- Expand window/crafting behavior only after conservative inventory clicks stay
+  stable.
+
 ## 0.2.0 - Beta 1.7.3 Protocol Handshake
 
 - TCP listener.
@@ -70,7 +115,7 @@ TODO:
 - Define authority rules for player movement and block edits.
 - Validate MVP digging, placement, held-item, animation, entity-action, and
   block-change behavior against a real Beta 1.7.3 client.
-- Replace placement fallback with real inventory-backed item/block validation.
+- Expand inventory-backed item/block validation beyond the MVP starter hotbar.
 - Keep common post-login packet IDs traceable, but do not guess unknown payload
   lengths.
 - Keep storage format original and documented.

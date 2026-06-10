@@ -24,16 +24,12 @@ blocks, and play survival.
 
 ## Current Status
 
-Aurelia is at the 0.4.0 playable survival prototype stage. The Rust workspace
-builds, starts a blocking TCP listener, accepts sockets, and runs each
-connection through a long-lived player session loop backed by shared game
-state. It contains packet codecs for handshake, disconnect, the observed
-serverbound Beta 1.7.3 login packet, provisional clientbound join packets, and
-fixed-size movement and interaction packets. The playable flat-world mode sends
-a spawn chunk area, streams newly needed chunks as the player changes chunks,
-keeps the socket open while movement packets update server-side player state,
-and sends block-change updates for simple break/place actions. This does not
-yet prove full real-client compatibility.
+Aurelia is at the 0.1.3 Survival Interaction Polish stage. A real Beta 1.7.3
+client can join the experimental flat-world path, receive chunks, move, break
+and place blocks from a starter hotbar, run short chat/debug commands, click
+inventory slots conservatively, save dirty flat-world edits, quit cleanly, and
+rejoin with saved edits. This is still an MVP compatibility target, not a
+complete Beta 1.7.3 server.
 
 ## Why Beta 1.7.3
 
@@ -96,7 +92,7 @@ For trace-only continuation after the client handshake:
 cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --trace-packets --trace-packet-limit 8 --trace-continue-after-handshake
 ```
 
-For the experimental playable prototype:
+For the stable survival-session MVP:
 
 ```bash
 cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --playable-flat-world --trace-packets --trace-packet-limit 64
@@ -117,8 +113,13 @@ cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --trace-packets --t
 ```
 
 `--playable-flat-world` currently sends chunk `(0,0)` and its neighbors by
-default. Use `--chunk-radius 0` to send only the spawn chunk if a client rejects
-the wider initial area.
+default. Use `--chunk-radius 0` to send only the spawn chunk if needed. Dirty
+flat-world chunks are saved under `<world>/aurelia-flat-v1/`. For login
+regression debugging, `--no-inventory-sync`, `--no-time-update`, and
+`--no-keepalive` disable only those clientbound features. `--defer-inventory-sync`
+keeps starter inventory delayed until after several post-join movement packets
+(the current default), and `--post-join-minimal` suppresses optional post-join
+clientbound packets for core stream-alignment testing.
 
 ## What Works Now
 
@@ -129,37 +130,60 @@ the wider initial area.
 - Protocol version `14` check.
 - Provisional login response, spawn position, player position/look, chunk
   visibility, and chunk data sends.
+- Initial join now sends chunk visibility/data before inventory sync, time
+  update, keepalive, or chat responses; Beta 1.7.3 time update is deferred
+  until the first client movement packet and starter inventory is delayed until
+  three additional movement packets.
 - Flat test world with grass at Y `63` and spawn air at Y `65`.
 - Chunk view tracking that sends missing chunks when a player changes chunks.
+- Periodic `0x00` keepalive and Beta 1.7.3 `0x04` time update packets while
+  joined. Aurelia encodes Beta 1.7.3 TimeUpdate as one `i64`, not the modern
+  two-long layout.
 - Movement packet reads for `0x0A`, `0x0B`, `0x0C`, and `0x0D`.
 - Joined-state interaction packet reads for `0x10` held item change, `0x12`
-  animation, `0x13` entity action, `0x0E` digging, and `0x0F` block placement.
-- MVP block break/place in visible loaded chunks, with `S->C 0x35 BlockChange`
-  responses to update or correct the client.
+  animation, `0x13` entity action, `0x0E` digging, `0x0F` block placement,
+  `0x65` close window, `0x66` window click, and `0x6A` confirm transaction.
+- Serverbound chat `0x03`, clientbound chat responses, and debug commands:
+  `/aurelia`, `/whereami`, `/givebasic`, `/save`, `/setblock`, and `/time`.
+- Starter hotbar sync through `S->C 0x68 SetWindowItems`, slot corrections
+  through `S->C 0x67 SetSlot`, and conservative window-click confirmation.
+- Player inventory window `0` maps hotbar indices `0..=8` to window slots
+  `36..=44`.
+- Inventory-backed block placement in visible loaded chunks. Successful
+  placement decrements the selected server-side hotbar stack and trace logs now
+  include click, face, target, hotbar index, window slot, item stack, block IDs,
+  result, and rejection reason.
+- Block breaking prevents bedrock edits, sends `S->C 0x35 BlockChange`, and
+  adds simple drops to inventory when space is available. Digging traces include
+  status names and drop destination.
+- Dirty modified chunks are saved and reloaded in an Aurelia-native MVP format.
 - Basic server-side player state, survival mode marker, health field, block
   get/set/break/place world APIs, selected hotbar slot, crouch flag, world time
   counter, and entity/mob scaffolding.
-- Trace names for common post-login packet IDs whose payload layouts still need
-  clean observations.
 
 ## Not Yet Implemented
 
 - Verified production login response semantics.
-- Chunk unload packets and persistent chunk storage.
-- Real inventory, item validation, tool speed, drops, permissions, crafting,
-  damage, and full survival loop.
-- Persistent chunk storage and chunk reserialization from mutated world state.
-- Visible mob spawn packets, AI, pathfinding, combat, and persistence.
-- Serverbound chat and keepalive payload decoding. These packet IDs are named
-  in traces, but their layouts are not implemented until documented from clean
-  observations.
+- Chunk unload packets.
+- Crafting, smelting, chests, workbench UI, and full inventory rules.
+- Item entities for overflow drops.
+- Placement remains conservative: no replaceable-block table beyond air
+  targets, no collision checks, no tool-speed timing, and no full interaction
+  semantics for use-on-block items yet.
+- Real health, damage, death, respawn, tool speed, permissions, and full
+  survival loop.
+- Visible mob spawn packets, AI, pathfinding, combat, and mob persistence.
+- Vanilla Anvil/Region world format. Current persistence is Aurelia-native and
+  limited to modified flat-world chunks.
 
 ## Roadmap Summary
 
 - 0.1.0: Project base, module scaffold, startup, protocol/world/region shells.
-- 0.2.0: Beta 1.7.3 protocol handshake.
-- 0.3.0: Flat world join.
-- 0.4.0: Basic world interaction.
+- 0.1.2: Stable Survival Session MVP.
+- 0.1.3: Survival Interaction Polish.
+- 0.2.0: Beta 1.7.3 protocol hardening.
+- 0.3.0: Flat world join polish.
+- 0.4.0: Basic world interaction polish.
 - 0.5.0: Region-threaded tick prototype.
 - 0.6.0: Survival foundation.
 - 0.7.0: Tile entities.

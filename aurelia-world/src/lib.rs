@@ -1,5 +1,8 @@
 use aurelia_common::{BlockPos, ChunkPos};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 pub const WORLD_HEIGHT: usize = 128;
 pub const SEA_LEVEL: usize = 64;
@@ -71,6 +74,39 @@ impl Chunk {
         self.block_ids.clone()
     }
 
+    pub fn copy_metadata(&self) -> Vec<u8> {
+        self.metadata.clone()
+    }
+
+    pub fn from_arrays(
+        pos: ChunkPos,
+        block_ids: Vec<u8>,
+        metadata: Vec<u8>,
+    ) -> Result<Self, String> {
+        if block_ids.len() != Self::BLOCK_COUNT {
+            return Err(format!(
+                "block id array length {} did not match {}",
+                block_ids.len(),
+                Self::BLOCK_COUNT
+            ));
+        }
+        if metadata.len() != Self::BLOCK_COUNT {
+            return Err(format!(
+                "metadata array length {} did not match {}",
+                metadata.len(),
+                Self::BLOCK_COUNT
+            ));
+        }
+        if metadata.iter().any(|value| *value > 15) {
+            return Err("metadata values must fit in 4 bits".to_string());
+        }
+        Ok(Self {
+            pos,
+            block_ids,
+            metadata,
+        })
+    }
+
     fn index(x: usize, y: usize, z: usize) -> usize {
         assert!(
             x < Self::WIDTH && y < Self::HEIGHT && z < Self::DEPTH,
@@ -109,11 +145,54 @@ pub trait WorldStorage {
     fn load_chunk(&self, pos: ChunkPos) -> Option<Chunk>;
     fn save_chunk(&mut self, chunk: Chunk);
     fn contains_chunk(&self, pos: ChunkPos) -> bool;
+    fn mark_dirty(&mut self, pos: ChunkPos);
+    fn dirty_chunk_count(&self) -> usize;
 }
 
 #[derive(Debug, Default)]
 pub struct InMemoryWorldStorage {
     chunks: HashMap<ChunkPos, Chunk>,
+    dirty_chunks: HashSet<ChunkPos>,
+}
+
+impl InMemoryWorldStorage {
+    const CHUNK_MAGIC: &'static [u8; 15] = b"AURELIA-CHUNK-1";
+
+    pub fn load_from_dir(path: &Path) -> io::Result<Self> {
+        let mut storage = Self::default();
+        if !path.exists() {
+            return Ok(storage);
+        }
+
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("achunk") {
+                continue;
+            }
+            let chunk = read_chunk_file(&path)?;
+            storage.chunks.insert(chunk.pos(), chunk);
+        }
+        Ok(storage)
+    }
+
+    pub fn save_dirty_to_dir(&mut self, path: &Path) -> io::Result<usize> {
+        if self.dirty_chunks.is_empty() {
+            return Ok(0);
+        }
+
+        fs::create_dir_all(path)?;
+        let dirty: Vec<ChunkPos> = self.dirty_chunks.iter().copied().collect();
+        let mut saved = 0;
+        for pos in dirty {
+            if let Some(chunk) = self.chunks.get(&pos) {
+                write_chunk_file(path, chunk)?;
+                self.dirty_chunks.remove(&pos);
+                saved += 1;
+            }
+        }
+        Ok(saved)
+    }
 }
 
 impl WorldStorage for InMemoryWorldStorage {
@@ -128,6 +207,80 @@ impl WorldStorage for InMemoryWorldStorage {
     fn contains_chunk(&self, pos: ChunkPos) -> bool {
         self.chunks.contains_key(&pos)
     }
+
+    fn mark_dirty(&mut self, pos: ChunkPos) {
+        self.dirty_chunks.insert(pos);
+    }
+
+    fn dirty_chunk_count(&self) -> usize {
+        self.dirty_chunks.len()
+    }
+}
+
+fn chunk_file_path(dir: &Path, pos: ChunkPos) -> std::path::PathBuf {
+    dir.join(format!("c.{}.{}.achunk", pos.x, pos.z))
+}
+
+fn write_chunk_file(dir: &Path, chunk: &Chunk) -> io::Result<()> {
+    let path = chunk_file_path(dir, chunk.pos());
+    let mut file = File::create(path)?;
+    file.write_all(InMemoryWorldStorage::CHUNK_MAGIC)?;
+    file.write_all(&chunk.pos().x.to_be_bytes())?;
+    file.write_all(&chunk.pos().z.to_be_bytes())?;
+    file.write_all(&(Chunk::BLOCK_COUNT as u32).to_be_bytes())?;
+    file.write_all(&chunk.copy_block_ids())?;
+    file.write_all(&(Chunk::BLOCK_COUNT as u32).to_be_bytes())?;
+    file.write_all(&chunk.copy_metadata())?;
+    Ok(())
+}
+
+fn read_chunk_file(path: &Path) -> io::Result<Chunk> {
+    let mut file = File::open(path)?;
+    let mut magic = [0; 15];
+    file.read_exact(&mut magic)?;
+    if &magic != InMemoryWorldStorage::CHUNK_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Aurelia chunk magic",
+        ));
+    }
+
+    let x = read_i32_file(&mut file)?;
+    let z = read_i32_file(&mut file)?;
+    let block_count = read_u32_file(&mut file)? as usize;
+    if block_count != Chunk::BLOCK_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid block id array length",
+        ));
+    }
+    let mut block_ids = vec![0; block_count];
+    file.read_exact(&mut block_ids)?;
+
+    let metadata_count = read_u32_file(&mut file)? as usize;
+    if metadata_count != Chunk::BLOCK_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid metadata array length",
+        ));
+    }
+    let mut metadata = vec![0; metadata_count];
+    file.read_exact(&mut metadata)?;
+
+    Chunk::from_arrays(ChunkPos::new(x, z), block_ids, metadata)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+fn read_i32_file(input: &mut impl Read) -> io::Result<i32> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(i32::from_be_bytes(bytes))
+}
+
+fn read_u32_file(input: &mut impl Read) -> io::Result<u32> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
 }
 
 #[derive(Debug)]
@@ -176,6 +329,10 @@ impl<S: WorldStorage> World<S> {
         self.time = self.time.wrapping_add(1);
     }
 
+    pub fn set_time(&mut self, time: u64) {
+        self.time = time;
+    }
+
     pub fn block_at(&mut self, pos: BlockPos) -> BlockState {
         if !Self::is_valid_block_pos(pos) {
             return BlockState::AIR;
@@ -197,6 +354,7 @@ impl<S: WorldStorage> World<S> {
         let mut chunk = self.get_or_create_chunk(chunk_pos);
         chunk.set_block(local_x, pos.y as usize, local_z, state);
         self.storage.save_chunk(chunk);
+        self.storage.mark_dirty(chunk_pos);
     }
 
     pub fn break_block(&mut self, pos: BlockPos) -> bool {
@@ -228,6 +386,20 @@ impl<S: WorldStorage> World<S> {
         }
         self.set_block(BlockPos::new(x, y, z), state);
         true
+    }
+
+    pub fn chunk_snapshot(&mut self, pos: ChunkPos) -> Chunk {
+        self.get_or_create_chunk(pos)
+    }
+
+    pub fn dirty_chunk_count(&self) -> usize {
+        self.storage.dirty_chunk_count()
+    }
+}
+
+impl World<InMemoryWorldStorage> {
+    pub fn save_dirty_chunks(&mut self, path: &Path) -> io::Result<usize> {
+        self.storage.save_dirty_to_dir(path)
     }
 }
 
@@ -375,6 +547,59 @@ mod tests {
     }
 
     #[test]
+    fn dirty_chunk_save_and_reload_preserves_changed_block() {
+        let dir = test_world_dir("single");
+        let _ = std::fs::remove_dir_all(&dir);
+        let pos = BlockPos::new(1, 70, 1);
+
+        let mut world = World::new(InMemoryWorldStorage::default(), FlatWorldGenerator);
+        world.set_block(pos, BlockState::DIRT);
+        assert_eq!(1, world.dirty_chunk_count());
+        assert_eq!(1, world.save_dirty_chunks(&dir).unwrap());
+        assert_eq!(0, world.dirty_chunk_count());
+
+        let storage = InMemoryWorldStorage::load_from_dir(&dir).unwrap();
+        let mut reloaded = World::new(storage, FlatWorldGenerator);
+        assert_eq!(BlockState::DIRT, reloaded.block_at(pos));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiple_dirty_chunks_save_and_reload() {
+        let dir = test_world_dir("multiple");
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = BlockPos::new(0, 70, 0);
+        let second = BlockPos::new(17, 71, -1);
+
+        let mut world = World::new(InMemoryWorldStorage::default(), FlatWorldGenerator);
+        world.set_block(first, BlockState::DIRT);
+        world.set_block(second, BlockState::STONE);
+
+        assert_eq!(2, world.dirty_chunk_count());
+        assert_eq!(2, world.save_dirty_chunks(&dir).unwrap());
+
+        let storage = InMemoryWorldStorage::load_from_dir(&dir).unwrap();
+        let mut reloaded = World::new(storage, FlatWorldGenerator);
+        assert_eq!(BlockState::DIRT, reloaded.block_at(first));
+        assert_eq!(BlockState::STONE, reloaded.block_at(second));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_generated_chunks_still_work_after_loading_empty_save_dir() {
+        let dir = test_world_dir("empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let storage = InMemoryWorldStorage::load_from_dir(&dir).unwrap();
+        let mut world = World::new(storage, FlatWorldGenerator);
+
+        assert_eq!(BlockState::GRASS, world.block_at(BlockPos::new(32, 63, 32)));
+        assert_eq!(0, world.dirty_chunk_count());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn world_time_ticks_forward() {
         let mut world = World::new(InMemoryWorldStorage::default(), FlatWorldGenerator);
 
@@ -406,5 +631,9 @@ mod tests {
             entities.despawn(player).map(|entity| entity.kind)
         );
         assert_eq!(1, entities.len());
+    }
+
+    fn test_world_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("aurelia-world-test-{name}-{}", std::process::id()))
     }
 }

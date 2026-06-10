@@ -181,6 +181,25 @@ impl PacketCodecRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepAlivePacket {
+    pub keep_alive_id: i32,
+}
+
+impl KeepAlivePacket {
+    pub const ID: u8 = 0x00;
+
+    pub fn decode(input: &mut impl Read) -> Result<Self> {
+        Ok(Self {
+            keep_alive_id: read_i32(input)?,
+        })
+    }
+
+    pub fn encode(&self, output: &mut impl Write) -> Result<()> {
+        write_i32(output, self.keep_alive_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakePacket {
     pub username: String,
@@ -291,6 +310,39 @@ impl PacketCodec<ServerboundLoginPacket> for ServerboundLoginPacketCodec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatPacket {
+    pub message: String,
+}
+
+impl ChatPacket {
+    pub const ID: u8 = 0x03;
+    pub const MESSAGE_MAX_CHARS: usize = 100;
+    pub const MESSAGE_HARD_MAX_CHARS: usize = 512;
+
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: truncate_utf16_units(message.into(), Self::MESSAGE_MAX_CHARS),
+        }
+    }
+
+    pub fn decode(input: &mut impl Read) -> Result<Self> {
+        Ok(Self::new(read_legacy_string_truncated(
+            input,
+            Self::MESSAGE_MAX_CHARS,
+            Self::MESSAGE_HARD_MAX_CHARS,
+        )?))
+    }
+
+    pub fn encode(&self, output: &mut impl Write) -> Result<()> {
+        write_legacy_string(
+            output,
+            &truncate_utf16_units(self.message.clone(), Self::MESSAGE_MAX_CHARS),
+            Self::MESSAGE_MAX_CHARS,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientboundLoginResponsePacket {
     pub entity_id: i32,
     pub level_type_or_unused: String,
@@ -365,6 +417,48 @@ impl ClientboundLoginResponsePacketCodec {
                 write_i8(output, packet.max_players)
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundBeta173TimeUpdatePacket {
+    pub time: i64,
+}
+
+impl ClientboundBeta173TimeUpdatePacket {
+    pub const ID: u8 = 0x04;
+}
+
+pub struct ClientboundBeta173TimeUpdatePacketCodec;
+
+impl ClientboundBeta173TimeUpdatePacketCodec {
+    pub fn encode(
+        packet: &ClientboundBeta173TimeUpdatePacket,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        write_i64(output, packet.time)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundModernTimeUpdatePacket {
+    pub world_age: i64,
+    pub time_of_day: i64,
+}
+
+impl ClientboundModernTimeUpdatePacket {
+    pub const ID: u8 = 0x04;
+}
+
+pub struct ClientboundModernTimeUpdatePacketCodec;
+
+impl ClientboundModernTimeUpdatePacketCodec {
+    pub fn encode(
+        packet: &ClientboundModernTimeUpdatePacket,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        write_i64(output, packet.world_age)?;
+        write_i64(output, packet.time_of_day)
     }
 }
 
@@ -551,6 +645,32 @@ pub mod experimental_flat_chunk_data {
         }
     }
 
+    pub fn chunk_from_block_arrays(
+        chunk_x: i32,
+        chunk_z: i32,
+        block_ids: &[u8],
+        metadata: &[u8],
+    ) -> ClientboundChunkDataPacket {
+        assert_eq!(BLOCK_BYTES, block_ids.len());
+        assert_eq!(BLOCK_BYTES, metadata.len());
+
+        let mut bytes = Vec::with_capacity(UNCOMPRESSED_FULL_CHUNK_BYTES);
+        bytes.extend_from_slice(block_ids);
+        bytes.extend_from_slice(&pack_nibbles(metadata));
+        bytes.extend(std::iter::repeat(0).take(NIBBLE_ARRAY_BYTES));
+        bytes.extend(std::iter::repeat(0xFF).take(NIBBLE_ARRAY_BYTES));
+
+        ClientboundChunkDataPacket {
+            x: chunk_x * WIDTH as i32,
+            y: 0,
+            z: chunk_z * LENGTH as i32,
+            width_minus_one: (WIDTH - 1) as u8,
+            height_minus_one: (HEIGHT - 1) as u8,
+            length_minus_one: (LENGTH - 1) as u8,
+            compressed_data: zlib_store(&bytes),
+        }
+    }
+
     pub fn uncompressed_full_chunk() -> Vec<u8> {
         let mut bytes = Vec::with_capacity(UNCOMPRESSED_FULL_CHUNK_BYTES);
         let mut block_ids = vec![0; BLOCK_BYTES];
@@ -591,6 +711,16 @@ pub mod experimental_flat_chunk_data {
         } else {
             0
         }
+    }
+
+    fn pack_nibbles(values: &[u8]) -> Vec<u8> {
+        let mut packed = Vec::with_capacity(values.len() / 2);
+        for pair in values.chunks(2) {
+            let low = pair[0] & 0x0F;
+            let high = pair.get(1).copied().unwrap_or(0) & 0x0F;
+            packed.push(low | (high << 4));
+        }
+        packed
     }
 
     fn zlib_store(input: &[u8]) -> Vec<u8> {
@@ -651,6 +781,9 @@ pub enum ServerboundPacketKind {
     HeldItemChange,
     Animation,
     EntityAction,
+    CloseWindow,
+    WindowClick,
+    ConfirmTransaction,
     Disconnect,
     Unknown(u8),
 }
@@ -671,6 +804,9 @@ impl ServerboundPacketKind {
             0x10 => Self::HeldItemChange,
             0x12 => Self::Animation,
             0x13 => Self::EntityAction,
+            0x65 => Self::CloseWindow,
+            0x66 => Self::WindowClick,
+            0x6A => Self::ConfirmTransaction,
             0xFF => Self::Disconnect,
             _ => Self::Unknown(packet_id),
         }
@@ -691,6 +827,9 @@ impl ServerboundPacketKind {
             Self::HeldItemChange => "HeldItemChange",
             Self::Animation => "Animation",
             Self::EntityAction => "EntityAction",
+            Self::CloseWindow => "CloseWindow",
+            Self::WindowClick => "WindowClick",
+            Self::ConfirmTransaction => "ConfirmTransaction",
             Self::Disconnect => "Disconnect",
             Self::Unknown(_) => "Unknown",
         }
@@ -698,6 +837,7 @@ impl ServerboundPacketKind {
 
     pub const fn fixed_payload_length(self) -> Option<usize> {
         match self {
+            Self::KeepAlive => Some(4),
             Self::Player => Some(1),
             Self::PlayerPosition => Some(33),
             Self::PlayerLook => Some(9),
@@ -706,6 +846,8 @@ impl ServerboundPacketKind {
             Self::HeldItemChange => Some(2),
             Self::Animation => Some(5),
             Self::EntityAction => Some(5),
+            Self::CloseWindow => Some(1),
+            Self::ConfirmTransaction => Some(4),
             _ => None,
         }
     }
@@ -714,7 +856,9 @@ impl ServerboundPacketKind {
         matches!(
             self,
             Self::Login
+                | Self::KeepAlive
                 | Self::Handshake
+                | Self::Chat
                 | Self::Player
                 | Self::PlayerPosition
                 | Self::PlayerLook
@@ -724,6 +868,9 @@ impl ServerboundPacketKind {
                 | Self::HeldItemChange
                 | Self::Animation
                 | Self::EntityAction
+                | Self::CloseWindow
+                | Self::WindowClick
+                | Self::ConfirmTransaction
                 | Self::Disconnect
         )
     }
@@ -906,7 +1053,7 @@ pub enum LegacySlotData {
 impl LegacySlotData {
     pub fn decode(input: &mut impl Read) -> Result<Self> {
         let item_id = read_i16(input)?;
-        if item_id < 0 {
+        if item_id == -1 {
             return Ok(Self::Empty);
         }
         Ok(Self::Present {
@@ -936,6 +1083,152 @@ impl LegacySlotData {
                 write_i16(output, damage)
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundCloseWindowPacket {
+    pub window_id: i8,
+}
+
+impl ServerboundCloseWindowPacket {
+    pub const ID: u8 = 0x65;
+
+    pub fn decode(input: &mut impl Read) -> Result<Self> {
+        Ok(Self {
+            window_id: read_i8(input)?,
+        })
+    }
+
+    pub fn encode(&self, output: &mut impl Write) -> Result<()> {
+        write_i8(output, self.window_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundWindowClickPacket {
+    pub window_id: i8,
+    pub slot: i16,
+    pub mouse_button: i8,
+    pub action_number: i16,
+    pub shift: bool,
+    pub clicked_item: LegacySlotData,
+}
+
+impl ServerboundWindowClickPacket {
+    pub const ID: u8 = 0x66;
+
+    pub fn decode(input: &mut impl Read) -> Result<Self> {
+        Ok(Self {
+            window_id: read_i8(input)?,
+            slot: read_i16(input)?,
+            mouse_button: read_i8(input)?,
+            action_number: read_i16(input)?,
+            shift: read_bool(input)?,
+            clicked_item: LegacySlotData::decode(input)?,
+        })
+    }
+
+    pub fn encode(&self, output: &mut impl Write) -> Result<()> {
+        write_i8(output, self.window_id)?;
+        write_i16(output, self.slot)?;
+        write_i8(output, self.mouse_button)?;
+        write_i16(output, self.action_number)?;
+        write_bool(output, self.shift)?;
+        self.clicked_item.encode(output)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundConfirmTransactionPacket {
+    pub window_id: i8,
+    pub action_number: i16,
+    pub accepted: bool,
+}
+
+impl ServerboundConfirmTransactionPacket {
+    pub const ID: u8 = 0x6A;
+
+    pub fn decode(input: &mut impl Read) -> Result<Self> {
+        Ok(Self {
+            window_id: read_i8(input)?,
+            action_number: read_i16(input)?,
+            accepted: read_bool(input)?,
+        })
+    }
+
+    pub fn encode(&self, output: &mut impl Write) -> Result<()> {
+        write_i8(output, self.window_id)?;
+        write_i16(output, self.action_number)?;
+        write_bool(output, self.accepted)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundSetSlotPacket {
+    pub window_id: i8,
+    pub slot: i16,
+    pub slot_data: LegacySlotData,
+}
+
+impl ClientboundSetSlotPacket {
+    pub const ID: u8 = 0x67;
+}
+
+pub struct ClientboundSetSlotPacketCodec;
+
+impl ClientboundSetSlotPacketCodec {
+    pub fn encode(packet: &ClientboundSetSlotPacket, output: &mut impl Write) -> Result<()> {
+        write_i8(output, packet.window_id)?;
+        write_i16(output, packet.slot)?;
+        packet.slot_data.encode(output)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundSetWindowItemsPacket {
+    pub window_id: i8,
+    pub slots: Vec<LegacySlotData>,
+}
+
+impl ClientboundSetWindowItemsPacket {
+    pub const ID: u8 = 0x68;
+}
+
+pub struct ClientboundSetWindowItemsPacketCodec;
+
+impl ClientboundSetWindowItemsPacketCodec {
+    pub fn encode(packet: &ClientboundSetWindowItemsPacket, output: &mut impl Write) -> Result<()> {
+        write_i8(output, packet.window_id)?;
+        write_i16(output, packet.slots.len() as i16)?;
+        for slot in &packet.slots {
+            slot.encode(output)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundConfirmTransactionPacket {
+    pub window_id: i8,
+    pub action_number: i16,
+    pub accepted: bool,
+}
+
+impl ClientboundConfirmTransactionPacket {
+    pub const ID: u8 = 0x6A;
+}
+
+pub struct ClientboundConfirmTransactionPacketCodec;
+
+impl ClientboundConfirmTransactionPacketCodec {
+    pub fn encode(
+        packet: &ClientboundConfirmTransactionPacket,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        write_i8(output, packet.window_id)?;
+        write_i16(output, packet.action_number)?;
+        write_bool(output, packet.accepted)
     }
 }
 
@@ -990,6 +1283,28 @@ pub fn read_legacy_string(input: &mut impl Read, max_chars: usize) -> Result<Str
     String::from_utf16(&units).map_err(|error| ProtocolError::InvalidData(error.to_string()))
 }
 
+pub fn read_legacy_string_truncated(
+    input: &mut impl Read,
+    max_chars: usize,
+    hard_max_chars: usize,
+) -> Result<String> {
+    validate_max_chars(max_chars)?;
+    validate_max_chars(hard_max_chars)?;
+    let length = read_u16(input)? as usize;
+    let kept_len = length.min(max_chars);
+    let mut kept = Vec::with_capacity(kept_len);
+    for index in 0..length {
+        let unit = read_u16(input)?;
+        if index < kept_len {
+            kept.push(unit);
+        }
+        if index >= hard_max_chars {
+            continue;
+        }
+    }
+    Ok(String::from_utf16_lossy(&kept))
+}
+
 pub fn write_legacy_string(output: &mut impl Write, value: &str, max_chars: usize) -> Result<()> {
     validate_max_chars(max_chars)?;
     let units: Vec<u16> = value.encode_utf16().collect();
@@ -1005,6 +1320,14 @@ pub fn write_legacy_string(output: &mut impl Write, value: &str, max_chars: usiz
         write_u16(output, unit)?;
     }
     Ok(())
+}
+
+pub fn truncate_utf16_units(value: String, max_chars: usize) -> String {
+    if value.encode_utf16().count() <= max_chars {
+        return value;
+    }
+
+    String::from_utf16_lossy(&value.encode_utf16().take(max_chars).collect::<Vec<u16>>())
 }
 
 fn validate_max_chars(max_chars: usize) -> Result<()> {
@@ -1275,12 +1598,28 @@ mod tests {
             ServerboundPacketKind::from_id(0x13)
         );
         assert_eq!(
+            ServerboundPacketKind::CloseWindow,
+            ServerboundPacketKind::from_id(0x65)
+        );
+        assert_eq!(
+            ServerboundPacketKind::WindowClick,
+            ServerboundPacketKind::from_id(0x66)
+        );
+        assert_eq!(
+            ServerboundPacketKind::ConfirmTransaction,
+            ServerboundPacketKind::from_id(0x6A)
+        );
+        assert_eq!(
             ServerboundPacketKind::Unknown(0x7E),
             ServerboundPacketKind::from_id(0x7E)
         );
         assert_eq!(
             Some(41),
             ServerboundPacketKind::PlayerPositionLook.fixed_payload_length()
+        );
+        assert_eq!(
+            Some(4),
+            ServerboundPacketKind::KeepAlive.fixed_payload_length()
         );
         assert_eq!(
             Some(11),
@@ -1298,9 +1637,22 @@ mod tests {
             Some(5),
             ServerboundPacketKind::EntityAction.fixed_payload_length()
         );
+        assert_eq!(
+            Some(1),
+            ServerboundPacketKind::CloseWindow.fixed_payload_length()
+        );
+        assert_eq!(
+            None,
+            ServerboundPacketKind::WindowClick.fixed_payload_length()
+        );
+        assert_eq!(
+            Some(4),
+            ServerboundPacketKind::ConfirmTransaction.fixed_payload_length()
+        );
         assert!(ServerboundPacketKind::PlayerDigging.has_documented_layout());
         assert!(ServerboundPacketKind::PlayerBlockPlacement.has_documented_layout());
-        assert!(!ServerboundPacketKind::Chat.has_documented_layout());
+        assert!(ServerboundPacketKind::WindowClick.has_documented_layout());
+        assert!(ServerboundPacketKind::Chat.has_documented_layout());
     }
 
     #[test]
@@ -1339,6 +1691,12 @@ mod tests {
 
     #[test]
     fn decodes_serverbound_interaction_packets() {
+        let keepalive = KeepAlivePacket::decode(&mut [0x00, 0x00, 0x00, 0x2A].as_slice()).unwrap();
+        assert_eq!(KeepAlivePacket { keep_alive_id: 42 }, keepalive);
+        let mut keepalive_bytes = Vec::new();
+        keepalive.encode(&mut keepalive_bytes).unwrap();
+        assert_eq!(vec![0x00, 0x00, 0x00, 0x2A], keepalive_bytes);
+
         let animation =
             ServerboundAnimationPacket::decode(&mut [0x00, 0x00, 0x00, 0x2A, 0x01].as_slice())
                 .unwrap();
@@ -1412,6 +1770,266 @@ mod tests {
         assert_eq!(LegacySlotData::Empty, empty.held_item);
         assert_eq!(12, empty_payload.position());
         assert_eq!(0x0D, read_u8(&mut empty_payload).unwrap());
+    }
+
+    #[test]
+    fn decodes_window_packets_and_consumes_clicked_item_slots_exactly() {
+        let mut close = std::io::Cursor::new([0x01, 0x0A]);
+        assert_eq!(
+            ServerboundCloseWindowPacket { window_id: 1 },
+            ServerboundCloseWindowPacket::decode(&mut close).unwrap()
+        );
+        assert_eq!(1, close.position());
+        assert_eq!(0x0A, read_u8(&mut close).unwrap());
+
+        let mut empty_click =
+            std::io::Cursor::new([0x00, 0x00, 0x05, 0x00, 0x00, 0x07, 0x00, 0xFF, 0xFF, 0x0A]);
+        assert_eq!(
+            ServerboundWindowClickPacket {
+                window_id: 0,
+                slot: 5,
+                mouse_button: 0,
+                action_number: 7,
+                shift: false,
+                clicked_item: LegacySlotData::Empty,
+            },
+            ServerboundWindowClickPacket::decode(&mut empty_click).unwrap()
+        );
+        assert_eq!(9, empty_click.position());
+        assert_eq!(
+            Some(ServerboundMovementPacket::Player { on_ground: true }),
+            ServerboundMovementPacket::decode(
+                read_u8(&mut empty_click).unwrap(),
+                &mut [1].as_slice()
+            )
+            .unwrap()
+        );
+
+        let mut non_empty_click = std::io::Cursor::new([
+            0x00, 0x00, 0x2A, 0x01, 0x00, 0x08, 0x01, 0x00, 0x03, 0x40, 0x00, 0x05, 0x0A,
+        ]);
+        assert_eq!(
+            ServerboundWindowClickPacket {
+                window_id: 0,
+                slot: 42,
+                mouse_button: 1,
+                action_number: 8,
+                shift: true,
+                clicked_item: LegacySlotData::Present {
+                    item_id: 3,
+                    count: 64,
+                    damage: 5,
+                },
+            },
+            ServerboundWindowClickPacket::decode(&mut non_empty_click).unwrap()
+        );
+        assert_eq!(12, non_empty_click.position());
+        assert_eq!(0x0A, read_u8(&mut non_empty_click).unwrap());
+
+        let confirm =
+            ServerboundConfirmTransactionPacket::decode(&mut [0x01, 0x00, 0x08, 0x01].as_slice())
+                .unwrap();
+        assert_eq!(
+            ServerboundConfirmTransactionPacket {
+                window_id: 1,
+                action_number: 8,
+                accepted: true,
+            },
+            confirm
+        );
+    }
+
+    #[test]
+    fn chat_decode_truncates_and_encode_is_beta_safe() {
+        let mut chat = Vec::new();
+        write_legacy_string(&mut chat, "hello", ChatPacket::MESSAGE_MAX_CHARS).unwrap();
+        assert_eq!(
+            "hello",
+            ChatPacket::decode(&mut chat.as_slice()).unwrap().message
+        );
+
+        let long = "x".repeat(ChatPacket::MESSAGE_MAX_CHARS + 10);
+        let packet = ChatPacket::new(long);
+        assert_eq!(ChatPacket::MESSAGE_MAX_CHARS, packet.message.len());
+        let mut encoded = Vec::new();
+        packet.encode(&mut encoded).unwrap();
+        assert_eq!(
+            ChatPacket::MESSAGE_MAX_CHARS as u16,
+            u16::from_be_bytes([encoded[0], encoded[1]])
+        );
+    }
+
+    #[test]
+    fn clientbound_survival_mvp_packets_encode_expected_payloads() {
+        let mut time = Vec::new();
+        ClientboundBeta173TimeUpdatePacketCodec::encode(
+            &ClientboundBeta173TimeUpdatePacket { time: 20 },
+            &mut time,
+        )
+        .unwrap();
+        assert_eq!(vec![0, 0, 0, 0, 0, 0, 0, 20], time);
+
+        let mut modern_time = Vec::new();
+        ClientboundModernTimeUpdatePacketCodec::encode(
+            &ClientboundModernTimeUpdatePacket {
+                world_age: 20,
+                time_of_day: 30,
+            },
+            &mut modern_time,
+        )
+        .unwrap();
+        assert_eq!(
+            vec![0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 30],
+            modern_time
+        );
+
+        let mut slot = Vec::new();
+        ClientboundSetSlotPacketCodec::encode(
+            &ClientboundSetSlotPacket {
+                window_id: 0,
+                slot: 36,
+                slot_data: LegacySlotData::Present {
+                    item_id: 3,
+                    count: 64,
+                    damage: 0,
+                },
+            },
+            &mut slot,
+        )
+        .unwrap();
+        assert_eq!(vec![0, 0, 36, 0, 3, 64, 0, 0], slot);
+
+        let mut items = Vec::new();
+        ClientboundSetWindowItemsPacketCodec::encode(
+            &ClientboundSetWindowItemsPacket {
+                window_id: 0,
+                slots: vec![
+                    LegacySlotData::Empty,
+                    LegacySlotData::Present {
+                        item_id: 4,
+                        count: 2,
+                        damage: 0,
+                    },
+                ],
+            },
+            &mut items,
+        )
+        .unwrap();
+        assert_eq!(vec![0, 0, 2, 0xFF, 0xFF, 0, 4, 2, 0, 0], items);
+
+        let mut confirm = Vec::new();
+        ClientboundConfirmTransactionPacketCodec::encode(
+            &ClientboundConfirmTransactionPacket {
+                window_id: 0,
+                action_number: 7,
+                accepted: true,
+            },
+            &mut confirm,
+        )
+        .unwrap();
+        assert_eq!(vec![0, 0, 7, 1], confirm);
+    }
+
+    #[test]
+    fn beta173_time_update_is_one_long_and_preserves_following_packet_boundary() {
+        let mut time_payload = Vec::new();
+        ClientboundBeta173TimeUpdatePacketCodec::encode(
+            &ClientboundBeta173TimeUpdatePacket { time: 0x73 },
+            &mut time_payload,
+        )
+        .unwrap();
+        assert_eq!(8, time_payload.len());
+
+        let mut items_payload = Vec::new();
+        ClientboundSetWindowItemsPacketCodec::encode(
+            &ClientboundSetWindowItemsPacket {
+                window_id: 0,
+                slots: vec![LegacySlotData::Empty],
+            },
+            &mut items_payload,
+        )
+        .unwrap();
+
+        let mut stream = Vec::new();
+        LegacyPacketFrameCodec::write(
+            &PacketFrame::new(ClientboundBeta173TimeUpdatePacket::ID, time_payload),
+            &mut stream,
+        )
+        .unwrap();
+        LegacyPacketFrameCodec::write(
+            &PacketFrame::new(ClientboundSetWindowItemsPacket::ID, items_payload),
+            &mut stream,
+        )
+        .unwrap();
+
+        assert_eq!(ClientboundBeta173TimeUpdatePacket::ID, stream[0]);
+        assert_eq!(ClientboundSetWindowItemsPacket::ID, stream[9]);
+        assert_ne!(0x73, stream[9]);
+    }
+
+    #[test]
+    fn beta173_set_window_items_slot_lengths_are_exact() {
+        let mut empty_slot = Vec::new();
+        LegacySlotData::Empty.encode(&mut empty_slot).unwrap();
+        assert_eq!(vec![0xFF, 0xFF], empty_slot);
+
+        let mut present_slot = Vec::new();
+        LegacySlotData::Present {
+            item_id: 4,
+            count: 2,
+            damage: 3,
+        }
+        .encode(&mut present_slot)
+        .unwrap();
+        assert_eq!(vec![0, 4, 2, 0, 3], present_slot);
+
+        let mut slots = vec![LegacySlotData::Empty; 45];
+        slots[36] = LegacySlotData::Present {
+            item_id: 3,
+            count: 64,
+            damage: 0,
+        };
+        slots[37] = LegacySlotData::Present {
+            item_id: 4,
+            count: 64,
+            damage: 0,
+        };
+        slots[38] = LegacySlotData::Present {
+            item_id: 5,
+            count: 64,
+            damage: 0,
+        };
+        slots[39] = LegacySlotData::Present {
+            item_id: 50,
+            count: 64,
+            damage: 0,
+        };
+        slots[40] = LegacySlotData::Present {
+            item_id: 270,
+            count: 1,
+            damage: 0,
+        };
+
+        let mut payload = Vec::new();
+        ClientboundSetWindowItemsPacketCodec::encode(
+            &ClientboundSetWindowItemsPacket {
+                window_id: 0,
+                slots,
+            },
+            &mut payload,
+        )
+        .unwrap();
+        assert_eq!(108, payload.len());
+        assert_eq!(&[0, 0, 45], &payload[..3]);
+
+        let mut stream = Vec::new();
+        LegacyPacketFrameCodec::write(
+            &PacketFrame::new(ClientboundSetWindowItemsPacket::ID, payload),
+            &mut stream,
+        )
+        .unwrap();
+        stream.push(0x0A);
+        assert_eq!(0x0A, stream[109]);
     }
 
     #[test]

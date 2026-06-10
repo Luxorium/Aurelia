@@ -9,13 +9,15 @@ contains packet model stubs, packet codec interfaces, a small packet frame
 helper for the leading packet ID byte plus caller-sized payload bytes, and
 typed codecs for handshake, observed serverbound login, provisional clientbound
 login response, spawn position, player position/look, experimental chunk data,
-and disconnect payloads.
+keepalive, chat, time, inventory/window sync, block changes, and disconnect
+payloads.
 A blocking TCP listener accepts clients and runs a per-connection player
 session loop backed by shared game state. With
 `--experimental-join --playable-flat-world`, the session can decode handshake
 and login, send provisional join packets, send a small flat spawn chunk area,
-stream newly needed chunks as the player changes chunks, and continue reading
-movement packets. This does not prove full world join compatibility yet.
+stream newly needed chunks as the player changes chunks, sync a starter hotbar,
+handle movement and basic survival interactions, and persist modified flat-world
+chunks. This is still an MVP compatibility path, not complete protocol support.
 Developer packet tracing can log incoming and outgoing packet metadata.
 
 Beta-era packets are not treated as length-prefixed frames here. Packet-specific
@@ -69,8 +71,8 @@ compatibility evidence until tested against a real Beta 1.7.3 client.
 - Playable flat-world mode keeps the socket open after join and updates
   server-side player state from fixed-size movement packets.
 - Chunk view tracking sends missing chunks around the current player chunk.
-- Common undocumented post-login packet IDs are named in traces, but their
-  payloads are not decoded until clean field layouts are captured.
+- KeepAlive, chat, inventory/window, digging, placement, and basic block-change
+  packets are decoded or written for the stable survival-session MVP.
 
 ### Observed In Current Aurelia Tests
 
@@ -81,7 +83,10 @@ compatibility evidence until tested against a real Beta 1.7.3 client.
   world-join-not-implemented disconnect.
 - Unknown, missing, and malformed initial packets receive explicit disconnect
   reasons where possible.
-- No test currently exercises a real Beta 1.7.3 client or server.
+- The latest manual real-client trace stayed connected through login, chunk
+  loading, movement, block breaking, block placement, crouch/entity action,
+  inventory open/close, and many `0x66 WindowClick` packets. The final
+  disconnect was a clean client quit.
 
 ### Clean-Room Assumptions
 
@@ -219,9 +224,15 @@ continues to show no terrain.
   `unusedOrSeed`, byte dimension.
 - Experimental `S->C 0x01` login response in two provisional modes.
 - Experimental `S->C 0x06` spawn position: three ints.
+- `0x00` KeepAlive: int keepalive ID.
+- `0x03` Chat: legacy string, truncated to a short Beta-safe limit.
+- Experimental Beta 1.7.3 `S->C 0x04` time update: one long time value.
 - Experimental `S->C 0x0D` player position/look: doubles, floats, boolean.
 - Experimental `S->C 0x32` set chunk visibility: two ints and a boolean.
 - Experimental `S->C 0x33` chunk data: Beta block-region compressed packet.
+- Experimental `S->C 0x67` set slot: window ID, slot, legacy slot data.
+- Experimental `S->C 0x68` set window items: window ID, slot count, slot array.
+- Experimental `0x6A` confirm transaction: window ID, action number, accepted.
 - `0xFF` Disconnect: reason string, currently limited to 100 characters.
 
 ## Codec Registry
@@ -239,12 +250,15 @@ clientbound packet codecs are implemented.
 ## Session Loop
 
 The server listener accepts TCP connections and creates a `PlayerSession` for
-each socket. The session tracks these states:
+each socket. The session tracks connection states:
 
 - `Handshaking`.
 - `Login`.
 - `Joined`.
 - `Disconnected`.
+
+Experimental join also tracks a finer join phase: `Handshaking`, `Login`,
+`SendingInitialWorld`, `AwaitingFirstClientMovement`, and `JoinedReady`.
 
 Current outcomes:
 
@@ -266,17 +280,49 @@ With `--experimental-join`, the listener instead attempts:
 4. Send provisional `S->C 0x01` login response using the selected mode.
 5. Send `S->C 0x06` spawn position.
 6. Send `S->C 0x0D` player position/look.
-7. Send `S->C 0x32` set chunk visibility.
-8. Send experimental `S->C 0x33` chunk data packets.
-9. Keep the connection open and read subsequent client packets.
+7. Enter `SendingInitialWorld`.
+8. Send `S->C 0x32` set chunk visibility.
+9. Send experimental `S->C 0x33` chunk data packets.
+10. Enter `AwaitingFirstClientMovement`.
+11. After the first `0x0A`, `0x0B`, `0x0C`, or `0x0D` movement packet, enter
+    `JoinedReady`.
+12. Send deferred `S->C 0x04` time update and start periodic keepalive/time
+    updates.
+13. After at least three additional movement/player packets, send deferred
+    `S->C 0x68` starter inventory/window items.
 
 With `--playable-flat-world`, the initial chunk radius defaults to `1`, sending
 the spawn chunk and its eight neighbors. Use `--chunk-radius 0` to send only
 chunk `(0,0)`.
 
+`--no-inventory-sync`, `--no-time-update`, and `--no-keepalive` disable only the
+newer clientbound survival-session features for compatibility testing.
+`--defer-inventory-sync` keeps starter inventory delayed until after several
+post-join movements; this is currently the default. `--post-join-minimal`
+suppresses TimeUpdate, inventory sync, SetSlot, ConfirmTransaction, chat
+responses, and KeepAlive scheduling. These flags do not disable chunk
+streaming, break/place, or server-side inventory state.
+
+### Clientbound `0x04` TimeUpdate
+
+In Beta 1.7.3/protocol 14 compatibility mode, Aurelia encodes `S->C 0x04`
+TimeUpdate as exactly one big-endian `i64` time value:
+
+- packet id: `0x04`;
+- payload: `time: i64`;
+- payload length: 8 bytes;
+- full packet length: 9 bytes.
+
+The modern two-long layout (`world_age: i64`, `time_of_day: i64`) is kept
+separate in code and is intentionally not used for Beta 1.7.3. Sending the
+modern layout to a Beta client leaves an extra long in the stream and corrupts
+the following packet boundary.
+
 The joined loop currently handles:
 
 - `C->S 0x0A Player`.
+- `C->S 0x00 KeepAlive`.
+- `C->S 0x03 Chat`.
 - `C->S 0x0B PlayerPosition`.
 - `C->S 0x0C PlayerLook`.
 - `C->S 0x0D PlayerPositionLook`.
@@ -285,23 +331,53 @@ The joined loop currently handles:
 - `C->S 0x10 HeldItemChange`.
 - `C->S 0x12 Animation`.
 - `C->S 0x13 EntityAction`.
+- `C->S 0x65 CloseWindow`.
+- `C->S 0x66 WindowClick`.
+- `C->S 0x6A ConfirmTransaction`.
 - `C->S 0xFF Disconnect`.
 
 Movement packets update the server-side player position, look, on-ground flag,
-and current chunk. Interaction packets are drained or applied conservatively:
-animation is ignored, entity action tracks crouch where possible, held item
-change stores slots `0..=8`, digging status `2` breaks reachable visible
-non-air blocks, and placement targets the selected face with an MVP block
-fallback. Unsupported post-join packet IDs are traced and receive a clear
-disconnect instead of panicking.
+and current chunk. KeepAlive responses are accepted leniently. Chat is echoed
+or handled as short debug commands. Interaction packets are applied
+conservatively: animation is ignored, entity action tracks crouch where
+possible, held item change stores hotbar indices `0..=8`, digging status `2`
+breaks reachable visible non-bedrock blocks and adds simple drops, and
+placement uses the selected server-side hotbar stack. Window clicks handle
+basic left/right pick-up and place behavior for window `0`; unsupported click
+modes are rejected with transaction failure plus inventory resync instead of
+disconnecting.
+Unsupported post-join packet IDs are traced and receive a clear disconnect
+instead of panicking.
 
-Common post-login packet IDs currently recognized by name but not decoded:
+### Inventory Slot Mapping
 
-- `0x00 KeepAlive`.
-- `0x03 Chat`.
+Aurelia currently treats player inventory window `0` as 45 slots. The hotbar
+maps directly to window slots:
 
-These are intentionally trace-first until field order and payload length are
-documented from clean observations.
+- hotbar index `0` -> window slot `36`;
+- hotbar index `8` -> window slot `44`.
+
+`C->S 0x10 HeldItemChange` selects hotbar indices `0..=8`; placement,
+`S->C 0x67 SetSlot`, and `S->C 0x68 SetWindowItems` all use the same mapping.
+
+### Placement And Digging Limits
+
+`C->S 0x0F PlayerBlockPlacement` with `x=-1`, `y=255`, `z=-1`, and
+`direction=-1` is treated as item-use-in-air. Aurelia logs it under packet
+trace/compat debug and does not mutate world state or decrement inventory.
+
+Normal placement is accepted only when the selected stack is a placeable block,
+the target is valid, loaded, in reach, and currently air, and the clicked block
+still exists. Rejections send corrective `0x35 BlockChange` packets for the
+clicked and target positions where applicable. Current rejection reasons are
+`no-selected-item`, `selected-not-placeable`, `target-unloaded`,
+`target-invalid-y`, `target-not-air`, `clicked-block-missing`, and
+`out-of-reach`.
+
+Digging status names used by logs are `start`, `cancel`, `finish`,
+`drop-stack`, `drop-item`, and `use-finish`. Only `finish` mutates blocks.
+Bedrock is protected, and simple drops are added to inventory only after a
+successful finish.
 
 ## Packet Trace Mode
 
@@ -315,14 +391,17 @@ Aurelia logs client-to-server packet metadata for packets it reads:
 Known packet names are direction-aware. Current names include `Handshake`,
 `Login` for `C->S 0x01`, `LoginResponse` for `S->C 0x01`, `Player`,
 `PlayerPosition`, `PlayerLook`, `PlayerPositionLook`, `SpawnPosition`,
-`SetChunkVisibility`, `ChunkData`, `BlockChange`, and `Disconnect`. Unknown
-packet IDs are formatted as `Unknown`. Because Beta-era packets are not
-length-prefixed here, unknown packet payload length is not inferred.
+`TimeUpdate`, `SetChunkVisibility`, `ChunkData`, `BlockChange`, `SetSlot`,
+`SetWindowItems`, `CloseWindow`, `WindowClick`, `ConfirmTransaction`, and
+`Disconnect`. Unknown packet IDs are formatted as `Unknown`. Because Beta-era
+packets are not length-prefixed here, unknown packet payload length is not
+inferred.
 
 Experimental post-login tracing reads known C->S movement packets with fixed
 payload sizes, plus documented fixed interaction packets:
 
 - `0x0A Player`: 1 byte.
+- `0x00 KeepAlive`: 4 bytes.
 - `0x0B PlayerPosition`: 33 bytes.
 - `0x0C PlayerLook`: 9 bytes.
 - `0x0D PlayerPositionLook`: 41 bytes.
@@ -330,11 +409,20 @@ payload sizes, plus documented fixed interaction packets:
 - `0x10 HeldItemChange`: 2 bytes.
 - `0x12 Animation`: 5 bytes.
 - `0x13 EntityAction`: 5 bytes.
+- `0x65 CloseWindow`: 1 byte.
+- `0x6A ConfirmTransaction`: 4 bytes.
 
 `0x0F PlayerBlockPlacement` is variable length because it carries legacy slot
 data. In Beta 1.7.3 Aurelia decodes `x`, `y`, `z`, `direction`, then slot data
 only. It must not read cursor bytes after the slot; those bytes belong to the
 next packet in observed real-client streams.
+
+`0x66 WindowClick` is also variable length. Aurelia decodes `window_id`, `slot`,
+`mouse_button`, `action_number`, `shift`, then legacy clicked-item slot data.
+Clicked-item slot data is `item_id`; if `item_id == -1`, the slot is empty and
+the packet ends. Otherwise Aurelia reads `count` and `damage`. Window `0`
+left/right clicks are handled for simple stack pickup/place behavior. Shift
+click and unsupported modes are rejected and followed by a full `0x68` resync.
 
 Packet tracing is developer-only. It should be used to capture clean behavior
 notes and byte streams, not as a compatibility claim. Redact any credentials,

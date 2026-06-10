@@ -1,36 +1,43 @@
 use aurelia_common::{BlockPos, ChunkPos};
 use aurelia_protocol::{
-    experimental_flat_chunk_data, read_u8, ClientboundBlockChangePacket,
+    experimental_flat_chunk_data, read_u8, ChatPacket, ClientboundBeta173TimeUpdatePacket,
+    ClientboundBeta173TimeUpdatePacketCodec, ClientboundBlockChangePacket,
     ClientboundBlockChangePacketCodec, ClientboundChunkDataPacket, ClientboundChunkDataPacketCodec,
     ClientboundChunkVisibilityPacket, ClientboundChunkVisibilityPacketCodec,
+    ClientboundConfirmTransactionPacket, ClientboundConfirmTransactionPacketCodec,
     ClientboundLoginResponseMode, ClientboundLoginResponsePacket,
     ClientboundLoginResponsePacketCodec, ClientboundPlayerPositionLookPacket,
-    ClientboundPlayerPositionLookPacketCodec, ClientboundSpawnPositionPacket,
+    ClientboundPlayerPositionLookPacketCodec, ClientboundSetSlotPacket,
+    ClientboundSetSlotPacketCodec, ClientboundSetWindowItemsPacket,
+    ClientboundSetWindowItemsPacketCodec, ClientboundSpawnPositionPacket,
     ClientboundSpawnPositionPacketCodec, DisconnectPacket, DisconnectPacketCodec, HandshakePacket,
-    HandshakePacketCodec, LegacyPacketFrameCodec, PacketCodec, PacketDirection, PacketFrame,
-    ProtocolError, ServerboundAnimationPacket, ServerboundEntityActionPacket,
-    ServerboundHeldItemChangePacket, ServerboundLoginPacket, ServerboundLoginPacketCodec,
-    ServerboundMovementPacket, ServerboundPacketKind, ServerboundPlayerBlockPlacementPacket,
-    ServerboundPlayerDiggingPacket, EXPECTED_PROTOCOL_VERSION, TARGET_VERSION,
+    HandshakePacketCodec, KeepAlivePacket, LegacyPacketFrameCodec, LegacySlotData, PacketCodec,
+    PacketDirection, PacketFrame, ProtocolError, ServerboundAnimationPacket,
+    ServerboundCloseWindowPacket, ServerboundConfirmTransactionPacket,
+    ServerboundEntityActionPacket, ServerboundHeldItemChangePacket, ServerboundLoginPacket,
+    ServerboundLoginPacketCodec, ServerboundMovementPacket, ServerboundPacketKind,
+    ServerboundPlayerBlockPlacementPacket, ServerboundPlayerDiggingPacket,
+    ServerboundWindowClickPacket, EXPECTED_PROTOCOL_VERSION, TARGET_VERSION,
 };
 use aurelia_region::RegionScheduler;
 use aurelia_world::{
-    BlockState, EntityId, EntityKind, EntityManager, FlatWorldGenerator, InMemoryWorldStorage,
-    World,
+    BlockState, Chunk, EntityId, EntityKind, EntityManager, FlatWorldGenerator,
+    InMemoryWorldStorage, World,
 };
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-pub const VERSION: &str = "0.1.0-SNAPSHOT";
+pub const VERSION: &str = "0.1.3-SNAPSHOT";
 pub const HANDSHAKE_RECEIVED_DISCONNECT: &str =
     "Aurelia received your handshake, but login is not implemented yet.";
 pub const MISSING_PACKET_DISCONNECT: &str =
@@ -123,11 +130,14 @@ pub mod trace {
         match packet_id {
             0x00 => Some("KeepAlive"),
             0x03 => Some("Chat"),
+            0x04 => Some("TimeUpdate"),
             id if id == ClientboundSpawnPositionPacket::ID => Some("SpawnPosition"),
             id if id == ClientboundPlayerPositionLookPacket::ID => Some("PlayerPositionLook"),
             id if id == ClientboundChunkVisibilityPacket::ID => Some("SetChunkVisibility"),
             id if id == ClientboundChunkDataPacket::ID => Some("ChunkData"),
             id if id == ClientboundBlockChangePacket::ID => Some("BlockChange"),
+            0x67 => Some("SetSlot"),
+            0x68 => Some("SetWindowItems"),
             id if id == HandshakePacket::ID => Some("Handshake"),
             id if id == DisconnectPacket::ID => Some("Disconnect"),
             0x0E => Some("PlayerDigging"),
@@ -135,6 +145,9 @@ pub mod trace {
             0x10 => Some("HeldItemChange"),
             0x12 => Some("Animation"),
             0x13 => Some("EntityAction"),
+            0x65 => Some("CloseWindow"),
+            0x66 => Some("WindowClick"),
+            0x6A => Some("ConfirmTransaction"),
             id if movement_payload_length(id).is_some() => match id {
                 0x0A => Some("Player"),
                 0x0B => Some("PlayerPosition"),
@@ -201,12 +214,18 @@ pub struct ServerConfig {
     pub login_response_mode: ClientboundLoginResponseMode,
     pub playable_flat_world: bool,
     pub initial_chunk_radius: i32,
+    pub inventory_sync_enabled: bool,
+    pub time_update_enabled: bool,
+    pub keepalive_enabled: bool,
+    pub defer_inventory_sync: bool,
+    pub post_join_minimal: bool,
 }
 
 impl ServerConfig {
     pub const DEFAULT_PACKET_TRACE_LIMIT: usize = 4;
     pub const DEFAULT_TRACE_HANDSHAKE_RESPONSE: &'static str = "-";
     pub const DEFAULT_INITIAL_CHUNK_RADIUS: i32 = 1;
+    pub const DEFAULT_DEFERRED_INVENTORY_MOVEMENTS: u32 = 3;
 
     pub fn new(host: impl Into<String>, port: u16, world_name: impl Into<String>) -> Result<Self> {
         Self::with_options(
@@ -238,6 +257,45 @@ impl ServerConfig {
         playable_flat_world: bool,
         initial_chunk_radius: i32,
     ) -> Result<Self> {
+        Self::with_options_and_features(
+            host,
+            port,
+            world_name,
+            packet_tracing_enabled,
+            packet_trace_limit,
+            trace_continue_after_handshake,
+            trace_handshake_response,
+            experimental_join_enabled,
+            login_response_mode,
+            playable_flat_world,
+            initial_chunk_radius,
+            true,
+            true,
+            true,
+            true,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_options_and_features(
+        host: impl Into<String>,
+        port: u16,
+        world_name: impl Into<String>,
+        packet_tracing_enabled: bool,
+        packet_trace_limit: usize,
+        trace_continue_after_handshake: bool,
+        trace_handshake_response: impl Into<String>,
+        experimental_join_enabled: bool,
+        login_response_mode: ClientboundLoginResponseMode,
+        playable_flat_world: bool,
+        initial_chunk_radius: i32,
+        inventory_sync_enabled: bool,
+        time_update_enabled: bool,
+        keepalive_enabled: bool,
+        defer_inventory_sync: bool,
+        post_join_minimal: bool,
+    ) -> Result<Self> {
         let config = Self {
             host: host.into(),
             port,
@@ -250,6 +308,11 @@ impl ServerConfig {
             login_response_mode,
             playable_flat_world,
             initial_chunk_radius,
+            inventory_sync_enabled,
+            time_update_enabled,
+            keepalive_enabled,
+            defer_inventory_sync,
+            post_join_minimal,
         };
         config.validate()?;
         Ok(config)
@@ -268,6 +331,11 @@ impl ServerConfig {
             login_response_mode: ClientboundLoginResponseMode::Beta173Observed,
             playable_flat_world: false,
             initial_chunk_radius: Self::DEFAULT_INITIAL_CHUNK_RADIUS,
+            inventory_sync_enabled: true,
+            time_update_enabled: true,
+            keepalive_enabled: true,
+            defer_inventory_sync: true,
+            post_join_minimal: false,
         }
     }
 
@@ -309,6 +377,11 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     let mut login_response_mode = defaults.login_response_mode;
     let mut playable_flat_world = defaults.playable_flat_world;
     let mut initial_chunk_radius = defaults.initial_chunk_radius;
+    let mut inventory_sync_enabled = defaults.inventory_sync_enabled;
+    let mut time_update_enabled = defaults.time_update_enabled;
+    let mut keepalive_enabled = defaults.keepalive_enabled;
+    let mut defer_inventory_sync = defaults.defer_inventory_sync;
+    let mut post_join_minimal = defaults.post_join_minimal;
 
     let mut index = 0;
     while index < args.len() {
@@ -366,11 +439,21 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
             index += 1;
             initial_chunk_radius =
                 parse_chunk_radius(required_arg_value(args, index, "--chunk-radius")?)?;
+        } else if arg == "--no-inventory-sync" {
+            inventory_sync_enabled = false;
+        } else if arg == "--no-time-update" {
+            time_update_enabled = false;
+        } else if arg == "--no-keepalive" {
+            keepalive_enabled = false;
+        } else if arg == "--defer-inventory-sync" {
+            defer_inventory_sync = true;
+        } else if arg == "--post-join-minimal" {
+            post_join_minimal = true;
         }
         index += 1;
     }
 
-    ServerConfig::with_options(
+    ServerConfig::with_options_and_features(
         host,
         port,
         world_name,
@@ -382,6 +465,11 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
         login_response_mode,
         playable_flat_world,
         initial_chunk_radius,
+        inventory_sync_enabled,
+        time_update_enabled,
+        keepalive_enabled,
+        defer_inventory_sync,
+        post_join_minimal,
     )
 }
 
@@ -420,12 +508,25 @@ fn parse_chunk_radius(value: &str) -> Result<i32> {
         .map_err(|_| ServerError::InvalidConfig(format!("invalid chunk radius: {value}")))
 }
 
+fn world_save_dir(config: &ServerConfig) -> PathBuf {
+    Path::new(&config.world_name).join("aurelia-flat-v1")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Handshaking,
     Login,
     Joined,
     Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinPhase {
+    Handshaking,
+    Login,
+    SendingInitialWorld,
+    AwaitingFirstClientMovement,
+    JoinedReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +541,7 @@ pub struct GameServerState {
     world: World<InMemoryWorldStorage>,
     entities: EntityManager,
     players: HashMap<String, EntityId>,
+    world_save_dir: Option<PathBuf>,
 }
 
 impl Default for GameServerState {
@@ -454,11 +556,27 @@ impl GameServerState {
             world: World::new(InMemoryWorldStorage::default(), FlatWorldGenerator),
             entities: EntityManager::default(),
             players: HashMap::new(),
+            world_save_dir: None,
         }
     }
 
     pub fn shared_flat() -> SharedGameServerState {
         Arc::new(Mutex::new(Self::new_flat()))
+    }
+
+    pub fn new_flat_persistent(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let storage = InMemoryWorldStorage::load_from_dir(&path)?;
+        Ok(Self {
+            world: World::new(storage, FlatWorldGenerator),
+            entities: EntityManager::default(),
+            players: HashMap::new(),
+            world_save_dir: Some(path),
+        })
+    }
+
+    pub fn shared_flat_persistent(path: impl Into<PathBuf>) -> Result<SharedGameServerState> {
+        Ok(Arc::new(Mutex::new(Self::new_flat_persistent(path)?)))
     }
 
     pub fn tick(&mut self) {
@@ -467,6 +585,10 @@ impl GameServerState {
 
     pub fn world_time(&self) -> u64 {
         self.world.time()
+    }
+
+    pub fn set_world_time(&mut self, time: u64) {
+        self.world.set_time(time);
     }
 
     pub fn block_at(&mut self, pos: BlockPos) -> BlockState {
@@ -499,6 +621,21 @@ impl GameServerState {
 
     pub fn place_block(&mut self, pos: BlockPos, state: BlockState) -> bool {
         self.world.place_block(pos, state)
+    }
+
+    pub fn chunk_snapshot(&mut self, pos: ChunkPos) -> Chunk {
+        self.world.chunk_snapshot(pos)
+    }
+
+    pub fn dirty_chunk_count(&self) -> usize {
+        self.world.dirty_chunk_count()
+    }
+
+    pub fn save_dirty_chunks(&mut self) -> Result<usize> {
+        let Some(path) = self.world_save_dir.as_ref() else {
+            return Ok(0);
+        };
+        Ok(self.world.save_dirty_chunks(path)?)
     }
 
     pub fn register_player(&mut self, username: impl Into<String>) -> EntityId {
@@ -582,6 +719,380 @@ impl Drop for ServerTickLoop {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerInventory {
+    slots: Vec<LegacySlotData>,
+    cursor: LegacySlotData,
+    selected_hotbar_slot: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowClickUpdate {
+    pub accepted: bool,
+    pub changed_slots: Vec<i16>,
+    pub cursor_changed: bool,
+}
+
+impl PlayerInventory {
+    pub const WINDOW_ID: i8 = 0;
+    pub const WINDOW_SLOT_COUNT: usize = 45;
+    pub const HOTBAR_START_SLOT: usize = 36;
+    pub const HOTBAR_LEN: usize = 9;
+    pub const CURSOR_WINDOW_ID: i8 = -1;
+    pub const CURSOR_SLOT: i16 = -1;
+    pub const DROP_SLOT: i16 = -999;
+    const MAX_STACK_SIZE: u8 = 64;
+
+    pub fn starter() -> Self {
+        let mut inventory = Self {
+            slots: vec![LegacySlotData::Empty; Self::WINDOW_SLOT_COUNT],
+            cursor: LegacySlotData::Empty,
+            selected_hotbar_slot: 0,
+        };
+        inventory.set_hotbar_stack(0, stack(3, 64, 0));
+        inventory.set_hotbar_stack(1, stack(4, 64, 0));
+        inventory.set_hotbar_stack(2, stack(5, 64, 0));
+        inventory.set_hotbar_stack(3, stack(50, 64, 0));
+        inventory.set_hotbar_stack(4, stack(270, 1, 0));
+        inventory
+    }
+
+    pub fn slots(&self) -> &[LegacySlotData] {
+        &self.slots
+    }
+
+    pub const fn cursor(&self) -> LegacySlotData {
+        self.cursor
+    }
+
+    pub fn set_selected_hotbar_slot(&mut self, slot: u8) {
+        if slot < Self::HOTBAR_LEN as u8 {
+            self.selected_hotbar_slot = slot;
+        }
+    }
+
+    pub const fn selected_hotbar_slot(&self) -> u8 {
+        self.selected_hotbar_slot
+    }
+
+    pub fn selected_window_slot(&self) -> i16 {
+        hotbar_index_to_window_slot(self.selected_hotbar_slot).unwrap_or(0)
+    }
+
+    pub fn selected_stack(&self) -> LegacySlotData {
+        self.slots[self.selected_window_slot() as usize]
+    }
+
+    pub fn set_hotbar_stack(&mut self, hotbar_slot: u8, stack: LegacySlotData) {
+        if let Some(slot) = hotbar_index_to_window_slot(hotbar_slot) {
+            self.slots[slot as usize] = stack;
+        }
+    }
+
+    pub fn placeable_selected_block(&self) -> Option<BlockState> {
+        let LegacySlotData::Present {
+            item_id,
+            count,
+            damage,
+        } = self.selected_stack()
+        else {
+            return None;
+        };
+        if count == 0 || !is_placeable_block_id(item_id) {
+            return None;
+        }
+        Some(BlockState::new_unchecked(
+            item_id as u8,
+            (damage & 0x0F) as u8,
+        ))
+    }
+
+    pub fn decrement_selected_stack(&mut self) -> Option<i16> {
+        let slot = self.selected_window_slot();
+        decrement_slot(&mut self.slots[slot as usize], 1).then_some(slot)
+    }
+
+    pub fn add_drop(&mut self, item_id: i16, count: u8, damage: i16) -> Vec<i16> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let mut remaining = count;
+        let mut changed = Vec::new();
+        for (index, slot) in self.slots.iter_mut().enumerate().skip(9) {
+            if remaining == 0 {
+                break;
+            }
+            let LegacySlotData::Present {
+                item_id: slot_item,
+                count: slot_count,
+                damage: slot_damage,
+            } = slot
+            else {
+                continue;
+            };
+            if *slot_item == item_id && *slot_damage == damage && *slot_count < Self::MAX_STACK_SIZE
+            {
+                let added = (Self::MAX_STACK_SIZE - *slot_count).min(remaining);
+                *slot_count += added;
+                remaining -= added;
+                changed.push(index as i16);
+            }
+        }
+
+        for (index, slot) in self.slots.iter_mut().enumerate().skip(9) {
+            if remaining == 0 {
+                break;
+            }
+            if *slot == LegacySlotData::Empty {
+                let added = Self::MAX_STACK_SIZE.min(remaining);
+                *slot = stack(item_id, added, damage);
+                remaining -= added;
+                changed.push(index as i16);
+            }
+        }
+        changed
+    }
+
+    pub fn handle_window_click(
+        &mut self,
+        packet: ServerboundWindowClickPacket,
+    ) -> WindowClickUpdate {
+        if packet.window_id != Self::WINDOW_ID || packet.shift {
+            return WindowClickUpdate::rejected();
+        }
+        if packet.slot == Self::DROP_SLOT {
+            let changed = self.cursor != LegacySlotData::Empty;
+            self.cursor = LegacySlotData::Empty;
+            return WindowClickUpdate {
+                accepted: true,
+                changed_slots: Vec::new(),
+                cursor_changed: changed,
+            };
+        }
+        if packet.slot < 0 || packet.slot as usize >= self.slots.len() {
+            return WindowClickUpdate::rejected();
+        }
+
+        let slot = packet.slot as usize;
+        match packet.mouse_button {
+            0 => self.left_click(slot),
+            1 => self.right_click(slot),
+            _ => WindowClickUpdate::rejected(),
+        }
+    }
+
+    fn left_click(&mut self, slot: usize) -> WindowClickUpdate {
+        let before_slot = self.slots[slot];
+        let before_cursor = self.cursor;
+        match (self.cursor, self.slots[slot]) {
+            (LegacySlotData::Empty, slot_stack) => {
+                self.cursor = slot_stack;
+                self.slots[slot] = LegacySlotData::Empty;
+            }
+            (cursor_stack, LegacySlotData::Empty) => {
+                self.slots[slot] = cursor_stack;
+                self.cursor = LegacySlotData::Empty;
+            }
+            (
+                LegacySlotData::Present {
+                    item_id,
+                    count,
+                    damage,
+                },
+                LegacySlotData::Present {
+                    item_id: slot_item_id,
+                    count: slot_count,
+                    damage: slot_damage,
+                },
+            ) if item_id == slot_item_id && damage == slot_damage => {
+                let space = Self::MAX_STACK_SIZE.saturating_sub(slot_count);
+                let moved = space.min(count);
+                self.slots[slot] = stack(slot_item_id, slot_count + moved, slot_damage);
+                self.cursor = if moved == count {
+                    LegacySlotData::Empty
+                } else {
+                    stack(item_id, count - moved, damage)
+                };
+            }
+            _ => {
+                std::mem::swap(&mut self.cursor, &mut self.slots[slot]);
+            }
+        }
+        self.click_update(slot, before_slot, before_cursor)
+    }
+
+    fn right_click(&mut self, slot: usize) -> WindowClickUpdate {
+        let before_slot = self.slots[slot];
+        let before_cursor = self.cursor;
+        match (self.cursor, self.slots[slot]) {
+            (
+                LegacySlotData::Empty,
+                LegacySlotData::Present {
+                    item_id,
+                    count,
+                    damage,
+                },
+            ) => {
+                let taken = (count + 1) / 2;
+                self.cursor = stack(item_id, taken, damage);
+                self.slots[slot] = if taken == count {
+                    LegacySlotData::Empty
+                } else {
+                    stack(item_id, count - taken, damage)
+                };
+            }
+            (
+                LegacySlotData::Present {
+                    item_id,
+                    count,
+                    damage,
+                },
+                LegacySlotData::Empty,
+            ) => {
+                self.slots[slot] = stack(item_id, 1, damage);
+                self.cursor = if count == 1 {
+                    LegacySlotData::Empty
+                } else {
+                    stack(item_id, count - 1, damage)
+                };
+            }
+            (
+                LegacySlotData::Present {
+                    item_id,
+                    count,
+                    damage,
+                },
+                LegacySlotData::Present {
+                    item_id: slot_item_id,
+                    count: slot_count,
+                    damage: slot_damage,
+                },
+            ) if item_id == slot_item_id
+                && damage == slot_damage
+                && slot_count < Self::MAX_STACK_SIZE =>
+            {
+                self.slots[slot] = stack(slot_item_id, slot_count + 1, slot_damage);
+                self.cursor = if count == 1 {
+                    LegacySlotData::Empty
+                } else {
+                    stack(item_id, count - 1, damage)
+                };
+            }
+            _ => {
+                std::mem::swap(&mut self.cursor, &mut self.slots[slot]);
+            }
+        }
+        self.click_update(slot, before_slot, before_cursor)
+    }
+
+    fn click_update(
+        &self,
+        slot: usize,
+        before_slot: LegacySlotData,
+        before_cursor: LegacySlotData,
+    ) -> WindowClickUpdate {
+        let mut changed_slots = Vec::new();
+        if self.slots[slot] != before_slot {
+            changed_slots.push(slot as i16);
+        }
+        WindowClickUpdate {
+            accepted: true,
+            changed_slots,
+            cursor_changed: self.cursor != before_cursor,
+        }
+    }
+}
+
+impl WindowClickUpdate {
+    pub fn rejected() -> Self {
+        Self {
+            accepted: false,
+            changed_slots: Vec::new(),
+            cursor_changed: false,
+        }
+    }
+}
+
+fn stack(item_id: i16, count: u8, damage: i16) -> LegacySlotData {
+    if count == 0 {
+        LegacySlotData::Empty
+    } else {
+        LegacySlotData::Present {
+            item_id,
+            count,
+            damage,
+        }
+    }
+}
+
+fn decrement_slot(slot: &mut LegacySlotData, amount: u8) -> bool {
+    let LegacySlotData::Present {
+        item_id,
+        count,
+        damage,
+    } = *slot
+    else {
+        return false;
+    };
+    if count <= amount {
+        *slot = LegacySlotData::Empty;
+    } else {
+        *slot = stack(item_id, count - amount, damage);
+    }
+    true
+}
+
+pub fn hotbar_index_to_window_slot(index: u8) -> Option<i16> {
+    (index < PlayerInventory::HOTBAR_LEN as u8)
+        .then_some((PlayerInventory::HOTBAR_START_SLOT + index as usize) as i16)
+}
+
+pub fn window_slot_to_hotbar_index(slot: i16) -> Option<u8> {
+    if slot < 0 {
+        return None;
+    }
+    let slot = slot as usize;
+    (PlayerInventory::HOTBAR_START_SLOT
+        ..PlayerInventory::HOTBAR_START_SLOT + PlayerInventory::HOTBAR_LEN)
+        .contains(&slot)
+        .then(|| (slot - PlayerInventory::HOTBAR_START_SLOT) as u8)
+}
+
+fn slot_data_summary(slot: LegacySlotData) -> String {
+    match slot {
+        LegacySlotData::Empty => "empty".to_string(),
+        LegacySlotData::Present {
+            item_id,
+            count,
+            damage,
+        } => {
+            if damage == 0 {
+                format!("{item_id}x{count}")
+            } else {
+                format!("{item_id}x{count}:{damage}")
+            }
+        }
+    }
+}
+
+fn selected_placeable_block(inventory: PlacementInventorySnapshot) -> BlockState {
+    let LegacySlotData::Present {
+        item_id, damage, ..
+    } = inventory.selected_stack
+    else {
+        return BlockState::AIR;
+    };
+    BlockState::new_unchecked(item_id as u8, (damage & 0x0F) as u8)
+}
+
+fn is_placeable_block_id(item_id: i16) -> bool {
+    matches!(
+        item_id,
+        1..=6 | 12..=24 | 35 | 41..=50 | 53..=58 | 61..=67 | 79..=91
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerState {
     pub username: String,
@@ -598,6 +1109,7 @@ pub struct PlayerState {
     pub current_chunk: ChunkPos,
     pub selected_hotbar_slot: u8,
     pub crouching: bool,
+    pub inventory: PlayerInventory,
 }
 
 impl PlayerState {
@@ -620,6 +1132,7 @@ impl PlayerState {
             current_chunk: ChunkPos::from_block(x.floor() as i32, z.floor() as i32),
             selected_hotbar_slot: 0,
             crouching: false,
+            inventory: PlayerInventory::starter(),
         }
     }
 
@@ -674,6 +1187,7 @@ impl PlayerState {
     pub fn set_hotbar_slot(&mut self, slot: u8) {
         if slot <= 8 {
             self.selected_hotbar_slot = slot;
+            self.inventory.set_selected_hotbar_slot(slot);
         }
     }
 
@@ -700,38 +1214,100 @@ pub enum SessionExit {
     ClientClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlacementInventorySnapshot {
+    hotbar_index: u8,
+    window_slot: i16,
+    selected_stack: LegacySlotData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlacementRejection {
+    NoSelectedItem,
+    SelectedNotPlaceable,
+    TargetUnloaded,
+    TargetInvalidY,
+    TargetNotAir,
+    ClickedBlockMissing,
+    OutOfReach,
+}
+
+impl PlacementRejection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSelectedItem => "no-selected-item",
+            Self::SelectedNotPlaceable => "selected-not-placeable",
+            Self::TargetUnloaded => "target-unloaded",
+            Self::TargetInvalidY => "target-invalid-y",
+            Self::TargetNotAir => "target-not-air",
+            Self::ClickedBlockMissing => "clicked-block-missing",
+            Self::OutOfReach => "out-of-reach",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlayerSession {
     config: ServerConfig,
     state_ref: SharedGameServerState,
     state: ConnectionState,
+    join_phase: JoinPhase,
     player: Option<PlayerState>,
     registered_username: Option<String>,
     sent_chunks: HashSet<ChunkPos>,
     last_packet_id: Option<u8>,
+    last_clientbound_packet_id: Option<u8>,
+    last_clientbound_payload_len: usize,
     trace_index: usize,
+    last_packet_at: Instant,
+    last_keepalive_sent_at: Instant,
+    last_time_sent_at: Instant,
+    joined_ready_movement_packets: u32,
+    inventory_sync_sent: bool,
+    next_keepalive_id: i32,
+    pending_keepalive_id: Option<i32>,
 }
 
 impl PlayerSession {
+    const READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+    const TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+    const CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
+
     pub fn new(config: ServerConfig) -> Self {
         Self::with_state(config, GameServerState::shared_flat())
     }
 
     pub fn with_state(config: ServerConfig, state_ref: SharedGameServerState) -> Self {
+        let now = Instant::now();
         Self {
             config,
             state_ref,
             state: ConnectionState::Handshaking,
+            join_phase: JoinPhase::Handshaking,
             player: None,
             registered_username: None,
             sent_chunks: HashSet::new(),
             last_packet_id: None,
+            last_clientbound_packet_id: None,
+            last_clientbound_payload_len: 0,
             trace_index: 0,
+            last_packet_at: now,
+            last_keepalive_sent_at: now,
+            last_time_sent_at: now,
+            joined_ready_movement_packets: 0,
+            inventory_sync_sent: false,
+            next_keepalive_id: 1,
+            pending_keepalive_id: None,
         }
     }
 
     pub const fn state(&self) -> ConnectionState {
         self.state
+    }
+
+    pub const fn join_phase(&self) -> JoinPhase {
+        self.join_phase
     }
 
     pub fn player(&self) -> Option<&PlayerState> {
@@ -758,16 +1334,28 @@ impl PlayerSession {
         connection: &mut (impl Read + Write),
     ) -> Result<Option<SessionExit>> {
         self.state = ConnectionState::Handshaking;
-        let packet_id = match read_u8(connection) {
-            Ok(packet_id) => packet_id,
-            Err(ProtocolError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {
-                return self
-                    .disconnect(connection, MISSING_PACKET_DISCONNECT)
-                    .map(Some);
+        self.join_phase = JoinPhase::Handshaking;
+        let packet_id = loop {
+            match read_u8(connection) {
+                Ok(packet_id) => break packet_id,
+                Err(ProtocolError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                    return self
+                        .disconnect(connection, MISSING_PACKET_DISCONNECT)
+                        .map(Some);
+                }
+                Err(ProtocolError::Io(error)) if is_read_timeout_error(&error) => {
+                    if Instant::now().duration_since(self.last_packet_at) > Self::CLIENT_TIMEOUT {
+                        return self
+                            .disconnect(connection, MISSING_PACKET_DISCONNECT)
+                            .map(Some);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         self.last_packet_id = Some(packet_id);
+        self.last_packet_at = Instant::now();
 
         if packet_id != HandshakePacket::ID {
             self.trace_packet(PacketDirection::ClientToServer, packet_id, &[]);
@@ -781,6 +1369,7 @@ impl PlayerSession {
                 let payload = HandshakePacketCodec::to_frame(&handshake)?.into_payload();
                 self.trace_packet(PacketDirection::ClientToServer, packet_id, &payload);
                 self.state = ConnectionState::Login;
+                self.join_phase = JoinPhase::Login;
                 if self.config.trace_continue_after_handshake
                     || self.config.experimental_join_enabled
                     || self.config.playable_flat_world
@@ -812,16 +1401,27 @@ impl PlayerSession {
             return Ok(None);
         }
 
-        let packet_id = match read_u8(connection) {
-            Ok(packet_id) => packet_id,
-            Err(ProtocolError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {
-                return self
-                    .disconnect(connection, MISSING_PACKET_DISCONNECT)
-                    .map(Some);
+        let packet_id = loop {
+            match read_u8(connection) {
+                Ok(packet_id) => break packet_id,
+                Err(ProtocolError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                    return self
+                        .disconnect(connection, MISSING_PACKET_DISCONNECT)
+                        .map(Some);
+                }
+                Err(ProtocolError::Io(error)) if is_read_timeout_error(&error) => {
+                    if Instant::now().duration_since(self.last_packet_at) > Self::CLIENT_TIMEOUT {
+                        return self
+                            .disconnect(connection, MISSING_PACKET_DISCONNECT)
+                            .map(Some);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         self.last_packet_id = Some(packet_id);
+        self.last_packet_at = Instant::now();
 
         if packet_id != ServerboundLoginPacket::ID {
             self.trace_packet(PacketDirection::ClientToServer, packet_id, &[]);
@@ -870,16 +1470,25 @@ impl PlayerSession {
 
     fn run_joined_loop(&mut self, connection: &mut (impl Read + Write)) -> Result<SessionExit> {
         loop {
+            self.send_due_periodic_packets(connection)?;
             let packet_id = match read_u8(connection) {
                 Ok(packet_id) => packet_id,
                 Err(ProtocolError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                    self.save_dirty_chunks_for_shutdown();
                     self.unregister_player();
                     self.log_session_close("client closed connection");
                     return Ok(SessionExit::ClientClosed);
                 }
+                Err(ProtocolError::Io(error)) if is_read_timeout_error(&error) => {
+                    if let Some(exit) = self.handle_idle_read(connection)? {
+                        return Ok(exit);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
             self.last_packet_id = Some(packet_id);
+            self.last_packet_at = Instant::now();
 
             let packet_kind = ServerboundPacketKind::from_id(packet_id);
             if let Some(payload_len) = packet_kind.fixed_payload_length() {
@@ -887,6 +1496,10 @@ impl PlayerSession {
                 connection.read_exact(&mut payload)?;
                 self.trace_packet(PacketDirection::ClientToServer, packet_id, &payload);
                 match packet_kind {
+                    ServerboundPacketKind::KeepAlive => {
+                        let packet = KeepAlivePacket::decode(&mut payload.as_slice())?;
+                        self.handle_keepalive(packet);
+                    }
                     ServerboundPacketKind::Player
                     | ServerboundPacketKind::PlayerPosition
                     | ServerboundPacketKind::PlayerLook
@@ -910,6 +1523,13 @@ impl PlayerSession {
                                     );
                                 }
                             }
+                            if self.join_phase == JoinPhase::AwaitingFirstClientMovement {
+                                self.mark_joined_ready(connection)?;
+                            } else if self.join_phase == JoinPhase::JoinedReady {
+                                self.joined_ready_movement_packets =
+                                    self.joined_ready_movement_packets.saturating_add(1);
+                                self.send_deferred_inventory_if_due(connection)?;
+                            }
                             self.stream_chunks_for_player(connection)?;
                         }
                     }
@@ -925,6 +1545,17 @@ impl PlayerSession {
                             (self.player.as_mut(), packet.hotbar_slot())
                         {
                             player.set_hotbar_slot(slot);
+                            if self.config.packet_tracing_enabled {
+                                if let Some(snapshot) = self.placement_inventory_snapshot() {
+                                    eprintln!(
+                                        "[session] held-item-change hotbar={} windowSlot={} item={} player={}",
+                                        snapshot.hotbar_index,
+                                        snapshot.window_slot,
+                                        slot_data_summary(snapshot.selected_stack),
+                                        self.player_name_for_log()
+                                    );
+                                }
+                            }
                         }
                     }
                     ServerboundPacketKind::Animation => {
@@ -937,8 +1568,35 @@ impl PlayerSession {
                             player.apply_entity_action(packet.action_id);
                         }
                     }
+                    ServerboundPacketKind::CloseWindow => {
+                        let packet = ServerboundCloseWindowPacket::decode(&mut payload.as_slice())?;
+                        self.log_close_window(packet);
+                    }
+                    ServerboundPacketKind::ConfirmTransaction => {
+                        let packet =
+                            ServerboundConfirmTransactionPacket::decode(&mut payload.as_slice())?;
+                        self.log_confirm_transaction(packet);
+                    }
                     _ => {}
                 }
+                continue;
+            }
+
+            if packet_id == ChatPacket::ID {
+                let packet = ChatPacket::decode(connection)?;
+                let mut payload = Vec::new();
+                packet.encode(&mut payload)?;
+                self.trace_packet(PacketDirection::ClientToServer, packet_id, &payload);
+                self.handle_chat(packet, connection)?;
+                continue;
+            }
+
+            if packet_id == ServerboundWindowClickPacket::ID {
+                let packet = ServerboundWindowClickPacket::decode(connection)?;
+                let mut payload = Vec::new();
+                packet.encode(&mut payload)?;
+                self.trace_packet(PacketDirection::ClientToServer, packet_id, &payload);
+                self.handle_window_click(packet, connection)?;
                 continue;
             }
 
@@ -954,6 +1612,7 @@ impl PlayerSession {
             if packet_id == DisconnectPacket::ID {
                 let packet = DisconnectPacketCodec::decode(connection)?;
                 self.state = ConnectionState::Disconnected;
+                self.save_dirty_chunks_for_shutdown();
                 self.unregister_player();
                 self.log_session_close(&format!("client disconnected: {}", packet.reason));
                 return Ok(SessionExit::Disconnected(packet.reason));
@@ -1005,7 +1664,83 @@ impl PlayerSession {
             },
         )?;
 
+        self.join_phase = JoinPhase::SendingInitialWorld;
+        eprintln!(
+            "[session] join phase: sending initial chunks player={} entity={} chunkRadius={}",
+            self.player_name_for_log(),
+            entity_id,
+            self.chunk_radius()
+        );
         self.stream_chunks_for_player(connection)?;
+        eprintln!(
+            "[session] join phase: initial chunks complete player={} sentChunks={}",
+            self.player_name_for_log(),
+            self.sent_chunks.len()
+        );
+        self.join_phase = JoinPhase::AwaitingFirstClientMovement;
+        eprintln!(
+            "[session] join phase: waiting for first movement player={}",
+            self.player_name_for_log()
+        );
+        eprintln!(
+            "[session] join complete player={} entity={} chunkRadius={}",
+            self.player_name_for_log(),
+            entity_id,
+            self.chunk_radius()
+        );
+        Ok(())
+    }
+
+    fn mark_joined_ready(&mut self, connection: &mut impl Write) -> Result<()> {
+        if self.join_phase != JoinPhase::AwaitingFirstClientMovement {
+            return Ok(());
+        }
+        self.join_phase = JoinPhase::JoinedReady;
+        self.joined_ready_movement_packets = 0;
+        self.inventory_sync_sent = false;
+        eprintln!(
+            "[session] join phase: joined ready player={} chunk={}",
+            self.player_name_for_log(),
+            self.player_chunk_for_log()
+        );
+
+        if self.should_send_time_update() {
+            self.send_time_update(connection)?;
+            eprintln!(
+                "[session] deferred time update sent player={} payloadLength={}",
+                self.player_name_for_log(),
+                self.last_clientbound_payload_len
+            );
+        }
+        self.send_deferred_inventory_if_due(connection)?;
+        if self.config.keepalive_enabled && !self.config.post_join_minimal {
+            self.last_keepalive_sent_at = Instant::now();
+            eprintln!(
+                "[session] keepalive scheduler started player={}",
+                self.player_name_for_log()
+            );
+        }
+        Ok(())
+    }
+
+    fn send_deferred_inventory_if_due(&mut self, connection: &mut impl Write) -> Result<()> {
+        if self.inventory_sync_sent || !self.should_send_inventory_sync() {
+            return Ok(());
+        }
+        if self.config.defer_inventory_sync
+            && self.joined_ready_movement_packets
+                < ServerConfig::DEFAULT_DEFERRED_INVENTORY_MOVEMENTS
+        {
+            return Ok(());
+        }
+        self.send_inventory_window(connection)?;
+        self.inventory_sync_sent = true;
+        eprintln!(
+            "[session] deferred inventory sync sent player={} payloadLength={} movementPackets={}",
+            self.player_name_for_log(),
+            self.last_clientbound_payload_len,
+            self.joined_ready_movement_packets
+        );
         Ok(())
     }
 
@@ -1044,6 +1779,8 @@ impl PlayerSession {
             ClientboundLoginResponsePacket::ID,
             &payload,
         );
+        self.last_clientbound_packet_id = Some(ClientboundLoginResponsePacket::ID);
+        self.last_clientbound_payload_len = payload.len();
         LegacyPacketFrameCodec::write(
             &PacketFrame::new(ClientboundLoginResponsePacket::ID, payload),
             connection,
@@ -1060,15 +1797,18 @@ impl PlayerSession {
         let mut payload = Vec::new();
         encode(&mut payload)?;
         self.trace_packet(PacketDirection::ServerToClient, packet_id, &payload);
+        self.last_clientbound_packet_id = Some(packet_id);
+        self.last_clientbound_payload_len = payload.len();
         LegacyPacketFrameCodec::write(&PacketFrame::new(packet_id, payload), connection)?;
         Ok(())
     }
 
     fn write_chunk_pair(&mut self, connection: &mut impl Write, pos: ChunkPos) -> Result<()> {
-        self.with_game_state(|state| {
+        let chunk = self.with_game_state(|state| {
             state.ensure_chunk_loaded(pos);
-            Ok(())
+            Ok(state.chunk_snapshot(pos))
         })?;
+        let packet = chunk_data_packet_from_chunk(&chunk);
         self.write_clientbound_frame(
             connection,
             ClientboundChunkVisibilityPacket::ID,
@@ -1080,10 +1820,7 @@ impl PlayerSession {
             },
         )?;
         self.write_clientbound_frame(connection, ClientboundChunkDataPacket::ID, |payload| {
-            ClientboundChunkDataPacketCodec::encode(
-                &experimental_flat_chunk_data::chunk_at(pos.x, pos.z),
-                payload,
-            )
+            ClientboundChunkDataPacketCodec::encode(&packet, payload)
         })?;
         Ok(())
     }
@@ -1094,20 +1831,83 @@ impl PlayerSession {
         connection: &mut impl Write,
     ) -> Result<()> {
         let pos = BlockPos::new(packet.x, i32::from(packet.y), packet.z);
-        let should_break = packet.status == ServerboundPlayerDiggingPacket::FINISHED_DIGGING_STATUS
-            && self.is_block_loaded_for_player(pos)
-            && self.player_can_reach(pos);
+        let status = digging_status_name(packet.status);
+        let valid = GameServerState::is_valid_block_pos(pos);
+        let loaded = self.is_block_loaded_for_player(pos);
+        let reachable = self.player_can_reach(pos);
+        let current = valid
+            .then(|| self.with_game_state(|state| Ok(state.block_at(pos))))
+            .transpose()?
+            .unwrap_or(BlockState::AIR);
 
-        let state = self.with_game_state(|state| {
-            let current = state.block_at(pos);
-            if should_break && current != BlockState::AIR {
-                state.break_block(pos);
-                Ok(BlockState::AIR)
-            } else {
-                Ok(current)
+        if packet.status != ServerboundPlayerDiggingPacket::FINISHED_DIGGING_STATUS {
+            if valid && (!loaded || !reachable) {
+                self.write_block_change(connection, pos, current)?;
             }
+            self.log_digging(
+                packet,
+                pos,
+                current,
+                status,
+                if valid && (!loaded || !reachable) {
+                    "corrected"
+                } else {
+                    "ignored"
+                },
+                None,
+            );
+            return Ok(());
+        }
+
+        let reject_reason = if !valid {
+            Some("invalid-y")
+        } else if !loaded {
+            Some("target-unloaded")
+        } else if !reachable {
+            Some("out-of-reach")
+        } else if current == BlockState::AIR {
+            Some("air")
+        } else if current == BlockState::BEDROCK {
+            Some("bedrock")
+        } else {
+            None
+        };
+
+        if let Some(reason) = reject_reason {
+            if valid {
+                self.write_block_change(connection, pos, current)?;
+            }
+            self.log_digging(packet, pos, current, status, "rejected", Some(reason));
+            return Ok(());
+        }
+
+        let drop = drop_for_block(current);
+        self.with_game_state(|state| {
+            state.break_block(pos);
+            Ok(())
         })?;
-        self.write_block_change(connection, pos, state)
+        self.write_block_change(connection, pos, BlockState::AIR)?;
+        let mut drop_result = "none".to_string();
+        if let (Some((item_id, count, damage)), Some(player)) = (drop, self.player.as_mut()) {
+            let changed = player.inventory.add_drop(item_id, count, damage);
+            for slot in changed.iter().copied() {
+                self.write_inventory_slot(connection, PlayerInventory::WINDOW_ID, slot)?;
+            }
+            drop_result = if let Some(slot) = changed.first() {
+                format!("{item_id}x{count} inventorySlot={slot}")
+            } else {
+                format!("{item_id}x{count} inventory-full")
+            };
+        }
+        self.log_digging(
+            packet,
+            pos,
+            current,
+            status,
+            "broken",
+            Some(drop_result.as_str()),
+        );
+        Ok(())
     }
 
     fn handle_player_block_placement(
@@ -1116,30 +1916,620 @@ impl PlayerSession {
         connection: &mut impl Write,
     ) -> Result<()> {
         if packet.is_special_item_use() {
+            self.log_item_use_air();
             return Ok(());
         }
 
-        let Some(target) = placement_target_pos(
-            BlockPos::new(packet.x, i32::from(packet.y), packet.z),
-            packet.direction,
-        ) else {
-            let pos = BlockPos::new(packet.x, i32::from(packet.y), packet.z);
-            let state = self.with_game_state(|state| Ok(state.block_at(pos)))?;
-            return self.write_block_change(connection, pos, state);
+        let clicked = BlockPos::new(packet.x, i32::from(packet.y), packet.z);
+        let Some(target) = placement_target_pos(clicked, packet.direction) else {
+            let clicked_state = self.with_game_state(|state| Ok(state.block_at(clicked)))?;
+            self.write_block_change(connection, clicked, clicked_state)?;
+            self.log_placement(
+                packet,
+                clicked,
+                None,
+                self.placement_inventory_snapshot(),
+                clicked_state,
+                None,
+                "rejected",
+                Some("invalid-face"),
+            );
+            return Ok(());
         };
 
-        let desired = placement_block_state(packet.held_item.item_id());
-        let can_place = self.is_block_loaded_for_player(target) && self.player_can_reach(target);
-        let state = self.with_game_state(|state| {
-            let current = state.block_at(target);
-            if can_place && current == BlockState::AIR {
-                state.place_block(target, desired);
-                Ok(desired)
-            } else {
-                Ok(current)
-            }
+        let inventory = self.placement_inventory_snapshot();
+        let target_valid = GameServerState::is_valid_block_pos(target);
+        let clicked_valid = GameServerState::is_valid_block_pos(clicked);
+        let (clicked_state, target_state) = self.with_game_state(|state| {
+            Ok((
+                clicked_valid.then(|| state.block_at(clicked)),
+                target_valid.then(|| state.block_at(target)),
+            ))
         })?;
-        self.write_block_change(connection, target, state)
+        let reason =
+            self.placement_rejection_reason(inventory, target, clicked_state, target_state);
+
+        if let Some(reason) = reason {
+            if let Some(clicked_state) = clicked_state {
+                self.write_block_change(connection, clicked, clicked_state)?;
+            }
+            if let Some(target_state) = target_state {
+                self.write_block_change(connection, target, target_state)?;
+            }
+            self.log_placement(
+                packet,
+                clicked,
+                Some(target),
+                inventory,
+                clicked_state.unwrap_or(BlockState::AIR),
+                target_state,
+                "rejected",
+                Some(reason.as_str()),
+            );
+            return Ok(());
+        }
+
+        let desired = selected_placeable_block(inventory.expect("validated inventory"));
+        let placed = self.with_game_state(|state| Ok(state.place_block(target, desired)))?;
+        let actual = if placed {
+            desired
+        } else {
+            self.with_game_state(|state| Ok(state.block_at(target)))?
+        };
+        self.write_block_change(connection, target, actual)?;
+        if placed {
+            if let Some(player) = self.player.as_mut() {
+                if let Some(slot) = player.inventory.decrement_selected_stack() {
+                    self.write_inventory_slot(connection, PlayerInventory::WINDOW_ID, slot)?;
+                }
+            }
+            self.log_placement(
+                packet,
+                clicked,
+                Some(target),
+                inventory,
+                clicked_state.unwrap_or(BlockState::AIR),
+                Some(actual),
+                "placed",
+                None,
+            );
+        } else {
+            self.log_placement(
+                packet,
+                clicked,
+                Some(target),
+                inventory,
+                clicked_state.unwrap_or(BlockState::AIR),
+                Some(actual),
+                "rejected",
+                Some("target-not-air"),
+            );
+        }
+        Ok(())
+    }
+
+    fn placement_inventory_snapshot(&self) -> Option<PlacementInventorySnapshot> {
+        let player = self.player.as_ref()?;
+        Some(PlacementInventorySnapshot {
+            hotbar_index: player.inventory.selected_hotbar_slot(),
+            window_slot: player.inventory.selected_window_slot(),
+            selected_stack: player.inventory.selected_stack(),
+        })
+    }
+
+    fn placement_rejection_reason(
+        &self,
+        inventory: Option<PlacementInventorySnapshot>,
+        target: BlockPos,
+        clicked_state: Option<BlockState>,
+        target_state: Option<BlockState>,
+    ) -> Option<PlacementRejection> {
+        let Some(inventory) = inventory else {
+            return Some(PlacementRejection::NoSelectedItem);
+        };
+        let LegacySlotData::Present { item_id, count, .. } = inventory.selected_stack else {
+            return Some(PlacementRejection::NoSelectedItem);
+        };
+        if count == 0 {
+            return Some(PlacementRejection::NoSelectedItem);
+        }
+        if !is_placeable_block_id(item_id) {
+            return Some(PlacementRejection::SelectedNotPlaceable);
+        }
+        if !GameServerState::is_valid_block_pos(target) {
+            return Some(PlacementRejection::TargetInvalidY);
+        }
+        if !self.is_block_loaded_for_player(target) {
+            return Some(PlacementRejection::TargetUnloaded);
+        }
+        if !self.player_can_reach(target) {
+            return Some(PlacementRejection::OutOfReach);
+        }
+        if clicked_state.is_none() || clicked_state == Some(BlockState::AIR) {
+            return Some(PlacementRejection::ClickedBlockMissing);
+        }
+        if target_state != Some(BlockState::AIR) {
+            return Some(PlacementRejection::TargetNotAir);
+        }
+        None
+    }
+
+    fn log_item_use_air(&self) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        let inventory = self.placement_inventory_snapshot();
+        eprintln!(
+            "[session] item-use-air hotbar={} windowSlot={} item={} player={}",
+            inventory
+                .map(|snapshot| snapshot.hotbar_index.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            inventory
+                .map(|snapshot| snapshot.window_slot.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            inventory
+                .map(|snapshot| slot_data_summary(snapshot.selected_stack))
+                .unwrap_or_else(|| "empty".to_string()),
+            self.player_name_for_log()
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_placement(
+        &self,
+        packet: ServerboundPlayerBlockPlacementPacket,
+        clicked: BlockPos,
+        target: Option<BlockPos>,
+        inventory: Option<PlacementInventorySnapshot>,
+        clicked_state: BlockState,
+        target_state: Option<BlockState>,
+        result: &str,
+        reason: Option<&str>,
+    ) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        let target_text = target
+            .map(|target| format!("{},{},{}", target.x, target.y, target.z))
+            .unwrap_or_else(|| "<none>".to_string());
+        let hotbar = inventory
+            .map(|snapshot| snapshot.hotbar_index.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        let window_slot = inventory
+            .map(|snapshot| snapshot.window_slot.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        let item = inventory
+            .map(|snapshot| slot_data_summary(snapshot.selected_stack))
+            .unwrap_or_else(|| "empty".to_string());
+        let target_block = target_state
+            .map(|state| state.id.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        if let Some(reason) = reason {
+            eprintln!(
+                "[session] placement click={},{},{} face={} target={} hotbar={} windowSlot={} item={} clickedBlock={} targetBlock={} result={} reason={} player={}",
+                clicked.x,
+                clicked.y,
+                clicked.z,
+                packet.direction,
+                target_text,
+                hotbar,
+                window_slot,
+                item,
+                clicked_state.id,
+                target_block,
+                result,
+                reason,
+                self.player_name_for_log()
+            );
+        } else {
+            eprintln!(
+                "[session] placement click={},{},{} face={} target={} hotbar={} windowSlot={} item={} clickedBlock={} targetBlock={} result={} player={}",
+                clicked.x,
+                clicked.y,
+                clicked.z,
+                packet.direction,
+                target_text,
+                hotbar,
+                window_slot,
+                item,
+                clicked_state.id,
+                target_block,
+                result,
+                self.player_name_for_log()
+            );
+        }
+    }
+
+    fn log_digging(
+        &self,
+        packet: ServerboundPlayerDiggingPacket,
+        pos: BlockPos,
+        block: BlockState,
+        status: &str,
+        result: &str,
+        detail: Option<&str>,
+    ) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        if let Some(detail) = detail {
+            eprintln!(
+                "[session] digging status={} pos={},{},{} face={} block={} result={} detail={} player={}",
+                status,
+                pos.x,
+                pos.y,
+                pos.z,
+                packet.face,
+                block.id,
+                result,
+                detail,
+                self.player_name_for_log()
+            );
+        } else {
+            eprintln!(
+                "[session] digging status={} pos={},{},{} face={} block={} result={} player={}",
+                status,
+                pos.x,
+                pos.y,
+                pos.z,
+                packet.face,
+                block.id,
+                result,
+                self.player_name_for_log()
+            );
+        }
+    }
+
+    fn handle_window_click(
+        &mut self,
+        packet: ServerboundWindowClickPacket,
+        connection: &mut impl Write,
+    ) -> Result<()> {
+        let Some(player) = self.player.as_mut() else {
+            return Ok(());
+        };
+        let update = player.inventory.handle_window_click(packet);
+        self.write_confirm_transaction(
+            connection,
+            packet.window_id,
+            packet.action_number,
+            update.accepted,
+        )?;
+        if update.accepted {
+            for slot in update.changed_slots.iter().copied() {
+                self.write_inventory_slot(connection, PlayerInventory::WINDOW_ID, slot)?;
+            }
+            if update.cursor_changed {
+                self.write_cursor_slot(connection)?;
+            }
+            self.log_window_click_result(packet, &update);
+        } else {
+            self.send_inventory_window(connection)?;
+            self.log_window_click_result(packet, &update);
+        }
+        Ok(())
+    }
+
+    fn handle_chat(&mut self, packet: ChatPacket, connection: &mut impl Write) -> Result<()> {
+        let message = packet.message.trim();
+        if message.starts_with('/') {
+            let response = self.handle_command(message, connection)?;
+            self.send_chat(connection, response.as_str())?;
+            eprintln!(
+                "[session] chat command handled player={} command={}",
+                self.player_name_for_log(),
+                message.split_whitespace().next().unwrap_or("/")
+            );
+        } else if !message.is_empty() {
+            let response = format!("{}: {}", self.player_name_for_log(), message);
+            self.send_chat(connection, response.as_str())?;
+        }
+        Ok(())
+    }
+
+    fn handle_command(&mut self, command: &str, connection: &mut impl Write) -> Result<String> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        let Some(name) = parts.first().copied() else {
+            return Ok("Empty command.".to_string());
+        };
+        match name {
+            "/aurelia" => Ok(format!("Aurelia {VERSION} survival polish")),
+            "/whereami" => {
+                let Some(player) = self.player.as_ref() else {
+                    return Ok("No player state.".to_string());
+                };
+                Ok(format!(
+                    "pos {:.1} {:.1} {:.1} chunk {} {}",
+                    player.x, player.y, player.z, player.current_chunk.x, player.current_chunk.z
+                ))
+            }
+            "/givebasic" => {
+                if let Some(player) = self.player.as_mut() {
+                    player.inventory = PlayerInventory::starter();
+                    player.selected_hotbar_slot = 0;
+                }
+                self.send_inventory_window(connection)?;
+                Ok("Starter hotbar restored.".to_string())
+            }
+            "/save" => {
+                let saved = self.save_dirty_chunks()?;
+                Ok(format!("Saved {saved} dirty chunks."))
+            }
+            "/setblock" => self.handle_setblock_command(&parts, connection),
+            "/time" => self.handle_time_command(&parts, connection),
+            _ => Ok("Unknown Aurelia command.".to_string()),
+        }
+    }
+
+    fn handle_setblock_command(
+        &mut self,
+        parts: &[&str],
+        connection: &mut impl Write,
+    ) -> Result<String> {
+        if parts.len() != 5 && parts.len() != 6 {
+            return Ok("Usage: /setblock x y z id [meta]".to_string());
+        }
+        let Some(x) = parse_i32_arg(parts[1]) else {
+            return Ok("Invalid x.".to_string());
+        };
+        let Some(y) = parse_i32_arg(parts[2]) else {
+            return Ok("Invalid y.".to_string());
+        };
+        let Some(z) = parse_i32_arg(parts[3]) else {
+            return Ok("Invalid z.".to_string());
+        };
+        let Some(id) = parse_u8_arg(parts[4]) else {
+            return Ok("Invalid block id.".to_string());
+        };
+        let meta = if parts.len() == 6 {
+            let Some(meta) = parse_u8_arg(parts[5]) else {
+                return Ok("Invalid metadata.".to_string());
+            };
+            meta
+        } else {
+            0
+        };
+        let pos = BlockPos::new(x, y, z);
+        let changed = self.with_game_state(|state| Ok(state.set_block(x, y, z, id, meta)))?;
+        if changed {
+            self.write_block_change(connection, pos, BlockState::new_unchecked(id, meta & 0x0F))?;
+            Ok(format!("Set block {x} {y} {z} to {id}:{meta}."))
+        } else {
+            Ok("Set block rejected.".to_string())
+        }
+    }
+
+    fn handle_time_command(
+        &mut self,
+        parts: &[&str],
+        connection: &mut impl Write,
+    ) -> Result<String> {
+        if parts.len() == 1 {
+            let time = self.with_game_state(|state| Ok(state.world_time()))?;
+            return Ok(format!("Time is {time}."));
+        }
+        if parts.len() != 2 {
+            return Ok("Usage: /time [value]".to_string());
+        }
+        let Some(value) = parts.get(1).and_then(|value| value.parse::<u64>().ok()) else {
+            return Ok("Usage: /time [value]".to_string());
+        };
+        self.with_game_state(|state| {
+            state.set_world_time(value);
+            Ok(())
+        })?;
+        self.send_time_update(connection)?;
+        Ok(format!("Time set to {value}."))
+    }
+
+    fn should_send_inventory_sync(&self) -> bool {
+        self.config.inventory_sync_enabled
+            && !self.config.post_join_minimal
+            && self.join_phase == JoinPhase::JoinedReady
+    }
+
+    fn should_send_time_update(&self) -> bool {
+        self.config.time_update_enabled
+            && !self.config.post_join_minimal
+            && self.join_phase == JoinPhase::JoinedReady
+    }
+
+    fn send_inventory_window(&mut self, connection: &mut impl Write) -> Result<()> {
+        if !self.should_send_inventory_sync() {
+            return Ok(());
+        }
+        let slots = self
+            .player
+            .as_ref()
+            .map(|player| player.inventory.slots().to_vec())
+            .unwrap_or_else(|| vec![LegacySlotData::Empty; PlayerInventory::WINDOW_SLOT_COUNT]);
+        self.write_clientbound_frame(connection, ClientboundSetWindowItemsPacket::ID, |payload| {
+            ClientboundSetWindowItemsPacketCodec::encode(
+                &ClientboundSetWindowItemsPacket {
+                    window_id: PlayerInventory::WINDOW_ID,
+                    slots,
+                },
+                payload,
+            )
+        })?;
+        eprintln!(
+            "[session] inventory initialized player={} slots={}",
+            self.player_name_for_log(),
+            PlayerInventory::WINDOW_SLOT_COUNT
+        );
+        Ok(())
+    }
+
+    fn write_inventory_slot(
+        &mut self,
+        connection: &mut impl Write,
+        window_id: i8,
+        slot: i16,
+    ) -> Result<()> {
+        if !self.should_send_inventory_sync() {
+            return Ok(());
+        }
+        let slot_data = self
+            .player
+            .as_ref()
+            .and_then(|player| player.inventory.slots().get(slot as usize).copied())
+            .unwrap_or(LegacySlotData::Empty);
+        self.write_set_slot(connection, window_id, slot, slot_data)
+    }
+
+    fn write_cursor_slot(&mut self, connection: &mut impl Write) -> Result<()> {
+        if !self.should_send_inventory_sync() {
+            return Ok(());
+        }
+        let slot_data = self
+            .player
+            .as_ref()
+            .map(|player| player.inventory.cursor())
+            .unwrap_or(LegacySlotData::Empty);
+        self.write_set_slot(
+            connection,
+            PlayerInventory::CURSOR_WINDOW_ID,
+            PlayerInventory::CURSOR_SLOT,
+            slot_data,
+        )
+    }
+
+    fn write_set_slot(
+        &mut self,
+        connection: &mut impl Write,
+        window_id: i8,
+        slot: i16,
+        slot_data: LegacySlotData,
+    ) -> Result<()> {
+        if self.config.post_join_minimal || self.join_phase != JoinPhase::JoinedReady {
+            return Ok(());
+        }
+        self.write_clientbound_frame(connection, ClientboundSetSlotPacket::ID, |payload| {
+            ClientboundSetSlotPacketCodec::encode(
+                &ClientboundSetSlotPacket {
+                    window_id,
+                    slot,
+                    slot_data,
+                },
+                payload,
+            )
+        })
+    }
+
+    fn write_confirm_transaction(
+        &mut self,
+        connection: &mut impl Write,
+        window_id: i8,
+        action_number: i16,
+        accepted: bool,
+    ) -> Result<()> {
+        if self.config.post_join_minimal || self.join_phase != JoinPhase::JoinedReady {
+            return Ok(());
+        }
+        self.write_clientbound_frame(
+            connection,
+            ClientboundConfirmTransactionPacket::ID,
+            |payload| {
+                ClientboundConfirmTransactionPacketCodec::encode(
+                    &ClientboundConfirmTransactionPacket {
+                        window_id,
+                        action_number,
+                        accepted,
+                    },
+                    payload,
+                )
+            },
+        )
+    }
+
+    fn send_chat(&mut self, connection: &mut impl Write, message: &str) -> Result<()> {
+        if self.config.post_join_minimal || self.join_phase != JoinPhase::JoinedReady {
+            return Ok(());
+        }
+        self.write_clientbound_frame(connection, ChatPacket::ID, |payload| {
+            ChatPacket::new(message).encode(payload)
+        })
+    }
+
+    fn send_time_update(&mut self, connection: &mut impl Write) -> Result<()> {
+        if !self.should_send_time_update() {
+            return Ok(());
+        }
+        let time = self.with_game_state(|state| Ok(state.world_time()))?;
+        self.write_clientbound_frame(
+            connection,
+            ClientboundBeta173TimeUpdatePacket::ID,
+            |payload| {
+                ClientboundBeta173TimeUpdatePacketCodec::encode(
+                    &ClientboundBeta173TimeUpdatePacket { time: time as i64 },
+                    payload,
+                )
+            },
+        )?;
+        self.last_time_sent_at = Instant::now();
+        Ok(())
+    }
+
+    fn send_keepalive(&mut self, connection: &mut impl Write) -> Result<()> {
+        if !self.config.keepalive_enabled
+            || self.config.post_join_minimal
+            || self.join_phase != JoinPhase::JoinedReady
+        {
+            return Ok(());
+        }
+        let id = self.next_keepalive_id;
+        self.next_keepalive_id = self.next_keepalive_id.wrapping_add(1).max(1);
+        self.pending_keepalive_id = Some(id);
+        self.write_clientbound_frame(connection, KeepAlivePacket::ID, |payload| {
+            KeepAlivePacket { keep_alive_id: id }.encode(payload)
+        })?;
+        self.last_keepalive_sent_at = Instant::now();
+        eprintln!(
+            "[session] sent keepalive id={id} player={}",
+            self.player_name_for_log()
+        );
+        Ok(())
+    }
+
+    fn send_due_periodic_packets(&mut self, connection: &mut impl Write) -> Result<()> {
+        if self.join_phase != JoinPhase::JoinedReady {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if self.config.time_update_enabled
+            && !self.config.post_join_minimal
+            && now.duration_since(self.last_time_sent_at) >= Self::TIME_UPDATE_INTERVAL
+        {
+            self.send_time_update(connection)?;
+        }
+        if self.config.keepalive_enabled
+            && !self.config.post_join_minimal
+            && now.duration_since(self.last_keepalive_sent_at) >= Self::KEEPALIVE_INTERVAL
+        {
+            self.send_keepalive(connection)?;
+        }
+        Ok(())
+    }
+
+    fn handle_idle_read(&mut self, connection: &mut impl Write) -> Result<Option<SessionExit>> {
+        self.send_due_periodic_packets(connection)?;
+        if Instant::now().duration_since(self.last_packet_at) > Self::CLIENT_TIMEOUT {
+            return self
+                .disconnect(connection, "Aurelia timed out waiting for client packets.")
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn handle_keepalive(&mut self, packet: KeepAlivePacket) {
+        if self.pending_keepalive_id == Some(packet.keep_alive_id) {
+            self.pending_keepalive_id = None;
+        }
+        eprintln!(
+            "[session] received keepalive id={} player={}",
+            packet.keep_alive_id,
+            self.player_name_for_log()
+        );
     }
 
     fn write_block_change(
@@ -1195,6 +2585,23 @@ impl PlayerSession {
         action(&mut state)
     }
 
+    fn save_dirty_chunks(&self) -> Result<usize> {
+        let mut state = self
+            .state_ref
+            .lock()
+            .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
+        let dirty = state.dirty_chunk_count();
+        let saved = state.save_dirty_chunks()?;
+        eprintln!("[session] save completed dirtyChunks={dirty} saved={saved}");
+        Ok(saved)
+    }
+
+    fn save_dirty_chunks_for_shutdown(&self) {
+        if let Err(error) = self.save_dirty_chunks() {
+            eprintln!("[session] save failed: {error}");
+        }
+    }
+
     fn disconnect(
         &mut self,
         connection: &mut impl Write,
@@ -1206,6 +2613,7 @@ impl PlayerSession {
             &DisconnectPacket::new(reason.as_str()),
         )?;
         self.state = ConnectionState::Disconnected;
+        self.save_dirty_chunks_for_shutdown();
         self.unregister_player();
         self.log_session_close(&format!("server disconnected: {reason}"));
         Ok(SessionExit::Disconnected(reason))
@@ -1241,6 +2649,68 @@ impl PlayerSession {
             trace::format_payload_hex(&payload[..TRACE_HEX_BYTES]),
             payload.len() - TRACE_HEX_BYTES
         )
+    }
+
+    fn log_close_window(&self, packet: ServerboundCloseWindowPacket) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        eprintln!(
+            "[session] close-window windowId={} state={:?} player={} chunk={}",
+            packet.window_id,
+            self.state,
+            self.player_name_for_log(),
+            self.player_chunk_for_log()
+        );
+    }
+
+    fn log_window_click_result(
+        &self,
+        packet: ServerboundWindowClickPacket,
+        update: &WindowClickUpdate,
+    ) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        let changed_slots = if update.changed_slots.is_empty() {
+            "none".to_string()
+        } else {
+            update
+                .changed_slots
+                .iter()
+                .map(i16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        eprintln!(
+            "[session] window-click windowId={} slot={} button={} action={} shift={} clickedItem={} result={} changedSlots={} cursorChanged={} player={} chunk={}",
+            packet.window_id,
+            packet.slot,
+            packet.mouse_button,
+            packet.action_number,
+            packet.shift,
+            slot_data_summary(packet.clicked_item),
+            if update.accepted { "accepted" } else { "rejected" },
+            changed_slots,
+            update.cursor_changed,
+            self.player_name_for_log(),
+            self.player_chunk_for_log()
+        );
+    }
+
+    fn log_confirm_transaction(&self, packet: ServerboundConfirmTransactionPacket) {
+        if !self.config.packet_tracing_enabled {
+            return;
+        }
+        eprintln!(
+            "[session] confirm-transaction windowId={} action={} accepted={} state={:?} player={} chunk={}",
+            packet.window_id,
+            packet.action_number,
+            packet.accepted,
+            self.state,
+            self.player_name_for_log(),
+            self.player_chunk_for_log()
+        );
     }
 
     fn unregister_player(&mut self) {
@@ -1296,6 +2766,34 @@ impl PlayerSession {
             .map(|player| format!("{},{}", player.current_chunk.x, player.current_chunk.z))
             .unwrap_or_else(|| "<none>".to_string())
     }
+
+    fn disconnect_correlation_for_log(&self) -> String {
+        let serverbound = self
+            .last_packet_id
+            .map(|packet_id| {
+                format!(
+                    "{}(0x{packet_id:02X})",
+                    trace::packet_trace_name(PacketDirection::ClientToServer, packet_id)
+                        .unwrap_or("Unknown")
+                )
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        let clientbound = self
+            .last_clientbound_packet_id
+            .map(|packet_id| {
+                format!(
+                    "{}(0x{packet_id:02X}, payloadLength={})",
+                    trace::packet_trace_name(PacketDirection::ServerToClient, packet_id)
+                        .unwrap_or("Unknown"),
+                    self.last_clientbound_payload_len
+                )
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        format!(
+            "phase={:?} lastServerbound={} lastClientbound={}",
+            self.join_phase, serverbound, clientbound
+        )
+    }
 }
 
 pub fn chunks_in_radius(center: ChunkPos, radius: i32) -> Vec<ChunkPos> {
@@ -1326,14 +2824,71 @@ pub fn placement_target_pos(against: BlockPos, direction: i8) -> Option<BlockPos
     Some(against.offset(dx, dy, dz))
 }
 
-fn placement_block_state(item_id: Option<i16>) -> BlockState {
-    match item_id {
-        Some(1) => BlockState::STONE,
-        Some(2) => BlockState::GRASS,
-        Some(3) => BlockState::DIRT,
-        Some(id) if (1..=255).contains(&id) => BlockState::new_unchecked(id as u8, 0),
-        _ => BlockState::DIRT,
+fn chunk_data_packet_from_chunk(chunk: &Chunk) -> ClientboundChunkDataPacket {
+    let mut block_ids = vec![0; experimental_flat_chunk_data::BLOCK_BYTES];
+    let mut metadata = vec![0; experimental_flat_chunk_data::BLOCK_BYTES];
+    for x in 0..experimental_flat_chunk_data::WIDTH {
+        for z in 0..experimental_flat_chunk_data::LENGTH {
+            for y in 0..experimental_flat_chunk_data::HEIGHT {
+                let state = chunk.block_at(x, y, z);
+                let index = experimental_flat_chunk_data::block_index(x, y, z);
+                block_ids[index] = state.id;
+                metadata[index] = state.metadata;
+            }
+        }
     }
+    experimental_flat_chunk_data::chunk_from_block_arrays(
+        chunk.pos().x,
+        chunk.pos().z,
+        &block_ids,
+        &metadata,
+    )
+}
+
+fn drop_for_block(state: BlockState) -> Option<(i16, u8, i16)> {
+    match state.id {
+        0 | 7 => None,
+        1 => Some((4, 1, 0)),
+        2 | 3 => Some((3, 1, 0)),
+        id => Some((i16::from(id), 1, i16::from(state.metadata))),
+    }
+}
+
+fn digging_status_name(status: i8) -> &'static str {
+    match status {
+        0 => "start",
+        1 => "cancel",
+        2 => "finish",
+        3 => "drop-stack",
+        4 => "drop-item",
+        5 => "use-finish",
+        _ => "unknown",
+    }
+}
+
+fn parse_i32_arg(value: &str) -> Option<i32> {
+    value.parse().ok()
+}
+
+fn parse_u8_arg(value: &str) -> Option<u8> {
+    value.parse().ok()
+}
+
+fn is_read_timeout_error(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+fn client_disconnect_during_send(error: &ServerError) -> Option<&io::Error> {
+    let io_error = match error {
+        ServerError::Io(error) => error,
+        ServerError::Protocol(ProtocolError::Io(error)) => error,
+        ServerError::InvalidConfig(_) | ServerError::Protocol(_) => return None,
+    };
+    matches!(
+        io_error.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    )
+    .then_some(io_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1525,7 +3080,7 @@ impl ServerBootstrap {
     }
 
     pub fn start(self) -> Result<RunningServer> {
-        let state = GameServerState::shared_flat();
+        let state = GameServerState::shared_flat_persistent(world_save_dir(&self.config))?;
         {
             let mut state = state
                 .lock()
@@ -1572,12 +3127,24 @@ fn spawn_accept_loop(
         while running.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _addr)) => {
+                    if let Err(error) =
+                        stream.set_read_timeout(Some(PlayerSession::READ_POLL_INTERVAL))
+                    {
+                        eprintln!("failed to set client read timeout: {error}");
+                    }
                     let config = config.clone();
                     let state = Arc::clone(&state);
                     thread::spawn(move || {
                         let mut session = PlayerSession::with_state(config, state);
                         if let Err(error) = session.run(&mut stream) {
-                            eprintln!("connection handling failed: {error}");
+                            if let Some(io_error) = client_disconnect_during_send(&error) {
+                                eprintln!(
+                                    "client disconnected during join/send: {io_error}; {}",
+                                    session.disconnect_correlation_for_log()
+                                );
+                            } else {
+                                eprintln!("connection handling failed: {error}");
+                            }
                         }
                         let _ = stream.shutdown(Shutdown::Both);
                     });
@@ -1628,6 +3195,15 @@ impl RunningServer {
         if let Some(mut tick_loop) = self.tick_loop.take() {
             tick_loop.stop()?;
         }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
+            let dirty = state.dirty_chunk_count();
+            let saved = state.save_dirty_chunks()?;
+            eprintln!("[server] save completed dirtyChunks={dirty} saved={saved}");
+        }
         Ok(())
     }
 }
@@ -1671,6 +3247,11 @@ mod tests {
             ServerConfig::DEFAULT_INITIAL_CHUNK_RADIUS,
             config.initial_chunk_radius
         );
+        assert!(config.inventory_sync_enabled);
+        assert!(config.time_update_enabled);
+        assert!(config.keepalive_enabled);
+        assert!(config.defer_inventory_sync);
+        assert!(!config.post_join_minimal);
     }
 
     #[test]
@@ -1756,6 +3337,26 @@ mod tests {
         assert!(config.experimental_join_enabled);
         assert!(config.playable_flat_world);
         assert_eq!(0, config.initial_chunk_radius);
+    }
+
+    #[test]
+    fn parses_join_feature_disable_flags() {
+        let config = parse_config(&[
+            "--experimental-join",
+            "--playable-flat-world",
+            "--no-inventory-sync",
+            "--no-time-update",
+            "--no-keepalive",
+            "--defer-inventory-sync",
+            "--post-join-minimal",
+        ])
+        .unwrap();
+
+        assert!(!config.inventory_sync_enabled);
+        assert!(!config.time_update_enabled);
+        assert!(!config.keepalive_enabled);
+        assert!(config.defer_inventory_sync);
+        assert!(config.post_join_minimal);
     }
 
     #[test]
@@ -1860,6 +3461,10 @@ mod tests {
             trace::packet_trace_name(PacketDirection::ServerToClient, 0x0D)
         );
         assert_eq!(
+            Some("TimeUpdate"),
+            trace::packet_trace_name(PacketDirection::ServerToClient, 0x04)
+        );
+        assert_eq!(
             Some("SetChunkVisibility"),
             trace::packet_trace_name(PacketDirection::ServerToClient, 0x32)
         );
@@ -1896,8 +3501,28 @@ mod tests {
             trace::packet_trace_name(PacketDirection::ClientToServer, 0x13)
         );
         assert_eq!(
+            Some("CloseWindow"),
+            trace::packet_trace_name(PacketDirection::ClientToServer, 0x65)
+        );
+        assert_eq!(
+            Some("WindowClick"),
+            trace::packet_trace_name(PacketDirection::ClientToServer, 0x66)
+        );
+        assert_eq!(
+            Some("ConfirmTransaction"),
+            trace::packet_trace_name(PacketDirection::ClientToServer, 0x6A)
+        );
+        assert_eq!(
             Some("BlockChange"),
             trace::packet_trace_name(PacketDirection::ServerToClient, 0x35)
+        );
+        assert_eq!(
+            Some("SetSlot"),
+            trace::packet_trace_name(PacketDirection::ServerToClient, 0x67)
+        );
+        assert_eq!(
+            Some("SetWindowItems"),
+            trace::packet_trace_name(PacketDirection::ServerToClient, 0x68)
         );
         assert_eq!(
             None,
@@ -2065,6 +3690,177 @@ mod tests {
     }
 
     #[test]
+    fn login_sequence_defers_inventory_and_time_until_first_movement() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        assert_eq!(JoinPhase::AwaitingFirstClientMovement, session.join_phase());
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+        );
+        assert_eq!(
+            1,
+            packet_positions(&stream.written, ClientboundChunkDataPacket::ID).len()
+        );
+    }
+
+    #[test]
+    fn time_update_is_sent_after_first_movement_but_inventory_waits() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(JoinPhase::JoinedReady, session.join_phase());
+        let chunk_data = first_packet_position(&stream.written, ClientboundChunkDataPacket::ID)
+            .expect("chunk data should be sent during initial world");
+        let time = first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+            .expect("deferred time update should be sent");
+        assert!(time > chunk_data);
+        assert_eq!(
+            Some(8),
+            first_packet_payload_length(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
+    }
+
+    #[test]
+    fn deferred_inventory_is_sent_after_three_additional_movements() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(JoinPhase::JoinedReady, session.join_phase());
+        assert_eq!(3, session.joined_ready_movement_packets);
+        let time = first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+            .expect("deferred time update should be sent");
+        let inventory = first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+            .expect("deferred inventory sync should be sent");
+        assert!(inventory > time);
+    }
+
+    #[test]
+    fn no_inventory_sync_suppresses_deferred_set_window_items() {
+        let mut config = playable_config(0);
+        config.inventory_sync_enabled = false;
+        let mut session = PlayerSession::new(config);
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(JoinPhase::JoinedReady, session.join_phase());
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
+        assert!(
+            first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn no_time_update_suppresses_deferred_time_update() {
+        let mut config = playable_config(0);
+        config.time_update_enabled = false;
+        let mut session = PlayerSession::new(config);
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(JoinPhase::JoinedReady, session.join_phase());
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
+    }
+
+    #[test]
+    fn post_join_minimal_suppresses_optional_clientbound_packets() {
+        let mut config = playable_config(0);
+        config.post_join_minimal = true;
+        let mut session = PlayerSession::new(config);
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        input.extend(encoded_chat("/aurelia"));
+        input.extend(encoded_window_click(
+            0,
+            36,
+            0,
+            7,
+            false,
+            LegacySlotData::Empty,
+        ));
+        input.extend(encoded_keepalive(42));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(JoinPhase::JoinedReady, session.join_phase());
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetSlotPacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundConfirmTransactionPacket::ID)
+        );
+        assert_eq!(None, first_packet_position(&stream.written, ChatPacket::ID));
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, KeepAlivePacket::ID)
+        );
+    }
+
+    #[test]
     fn playable_session_sends_spawn_area_and_updates_movement() {
         let config = ServerConfig::with_options(
             "127.0.0.1",
@@ -2099,6 +3895,21 @@ mod tests {
         assert_eq!(90.0, player.yaw);
         assert!(player.on_ground);
         assert_eq!(ChunkPos::new(1, -1), player.current_chunk);
+        assert_eq!(JoinPhase::JoinedReady, session.join_phase());
+
+        let chunk_data_positions =
+            packet_positions(&stream.written, ClientboundChunkDataPacket::ID);
+        let initial_chunk_data = chunk_data_positions
+            .get(8)
+            .copied()
+            .expect("radius 1 login should send 9 initial chunk data frames");
+        let time = first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+            .expect("deferred time update should be sent");
+        assert!(time > initial_chunk_data);
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
 
         let mut output = stream.written.as_slice();
         assert_eq!(
@@ -2136,6 +3947,8 @@ mod tests {
             } else if packet_id == ClientboundChunkDataPacket::ID {
                 output = skip_chunk_data_frame(output);
                 chunk_data_frames += 1;
+            } else if let Some(next) = skip_known_clientbound_frame(output) {
+                output = next;
             } else {
                 panic!("unexpected packet id {packet_id:#04x}");
             }
@@ -2173,9 +3986,16 @@ mod tests {
         let _ = LegacyPacketFrameCodec::read(&mut output, 15).unwrap();
         let _ = LegacyPacketFrameCodec::read(&mut output, 12).unwrap();
         let _ = LegacyPacketFrameCodec::read(&mut output, 41).unwrap();
-        let _ = LegacyPacketFrameCodec::read(&mut output, 9).unwrap();
-        output = skip_chunk_data_frame(output);
-        assert!(output.is_empty());
+        let (_, chunk_data_frames) = count_chunk_frames(output);
+        assert_eq!(1, chunk_data_frames);
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
+        );
+        assert_eq!(
+            None,
+            first_packet_position(&stream.written, ClientboundBeta173TimeUpdatePacket::ID)
+        );
     }
 
     #[test]
@@ -2204,6 +4024,133 @@ mod tests {
         assert_eq!(
             Some(BlockPos::new(10, 65, -4)),
             placement_target_pos(BlockPos::new(10, 64, -4), 1)
+        );
+    }
+
+    #[test]
+    fn hotbar_window_slot_mapping_matches_beta_player_inventory() {
+        assert_eq!(Some(36), hotbar_index_to_window_slot(0));
+        assert_eq!(Some(44), hotbar_index_to_window_slot(8));
+        assert_eq!(None, hotbar_index_to_window_slot(9));
+        assert_eq!(Some(0), window_slot_to_hotbar_index(36));
+        assert_eq!(Some(8), window_slot_to_hotbar_index(44));
+        assert_eq!(None, window_slot_to_hotbar_index(35));
+        assert_eq!(None, window_slot_to_hotbar_index(45));
+    }
+
+    #[test]
+    fn player_inventory_starter_contents_match_survival_mvp_hotbar() {
+        let inventory = PlayerInventory::starter();
+
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 64,
+                damage: 0
+            },
+            inventory.slots()[36]
+        );
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 4,
+                count: 64,
+                damage: 0
+            },
+            inventory.slots()[37]
+        );
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 5,
+                count: 64,
+                damage: 0
+            },
+            inventory.slots()[38]
+        );
+    }
+
+    #[test]
+    fn held_item_change_maps_hotbar_to_expected_inventory_slot() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_held_item_change(8));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        let player = session.player().unwrap();
+        assert_eq!(8, player.selected_hotbar_slot);
+        assert_eq!(44, player.inventory.selected_window_slot());
+        assert_eq!(Some(8), window_slot_to_hotbar_index(44));
+    }
+
+    #[test]
+    fn window_click_moves_empty_and_non_empty_stacks() {
+        let mut inventory = PlayerInventory::starter();
+
+        let pickup = inventory.handle_window_click(ServerboundWindowClickPacket {
+            window_id: 0,
+            slot: 36,
+            mouse_button: 0,
+            action_number: 1,
+            shift: false,
+            clicked_item: LegacySlotData::Empty,
+        });
+        assert!(pickup.accepted);
+        assert_eq!(LegacySlotData::Empty, inventory.slots()[36]);
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 64,
+                damage: 0
+            },
+            inventory.cursor()
+        );
+
+        let place = inventory.handle_window_click(ServerboundWindowClickPacket {
+            window_id: 0,
+            slot: 9,
+            mouse_button: 0,
+            action_number: 2,
+            shift: false,
+            clicked_item: LegacySlotData::Empty,
+        });
+        assert!(place.accepted);
+        assert_eq!(LegacySlotData::Empty, inventory.cursor());
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 64,
+                damage: 0
+            },
+            inventory.slots()[9]
+        );
+
+        let split = inventory.handle_window_click(ServerboundWindowClickPacket {
+            window_id: 0,
+            slot: 37,
+            mouse_button: 1,
+            action_number: 3,
+            shift: false,
+            clicked_item: LegacySlotData::Empty,
+        });
+        assert!(split.accepted);
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 4,
+                count: 32,
+                damage: 0
+            },
+            inventory.cursor()
+        );
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 4,
+                count: 32,
+                damage: 0
+            },
+            inventory.slots()[37]
         );
     }
 
@@ -2293,6 +4240,77 @@ mod tests {
     }
 
     #[test]
+    fn window_click_followed_by_player_decodes_without_stream_desync() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_window_click(
+            0,
+            5,
+            0,
+            7,
+            false,
+            LegacySlotData::Empty,
+        ));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        assert!(session.player().unwrap().on_ground);
+    }
+
+    #[test]
+    fn close_window_followed_by_player_decodes_without_stream_desync() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_close_window(0));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        assert!(session.player().unwrap().on_ground);
+    }
+
+    #[test]
+    fn confirm_transaction_is_drained_without_disconnect() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_confirm_transaction(0, 7, true));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        assert!(session.player().unwrap().on_ground);
+    }
+
+    #[test]
+    fn keepalive_is_drained_without_disconnect() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_keepalive(42));
+        input.extend(encoded_player(true));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        assert!(session.player().unwrap().on_ground);
+    }
+
+    #[test]
     fn player_digging_finished_breaks_visible_block_and_sends_block_change() {
         let state = GameServerState::shared_flat();
         let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
@@ -2308,12 +4326,68 @@ mod tests {
             BlockState::AIR,
             state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
         );
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 1,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[9]
+        );
         assert!(
             block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
                 x: 0,
                 y: 63,
                 z: 0,
                 block_type: 0,
+                metadata: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn player_digging_start_and_cancel_do_not_mutate_block() {
+        let state = GameServerState::shared_flat();
+        let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player_digging(0, 0, 63, 0, 1));
+        input.extend(encoded_player_digging(1, 0, 63, 0, 1));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(
+            BlockState::GRASS,
+            state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
+        );
+        assert!(block_changes(&stream.written).is_empty());
+    }
+
+    #[test]
+    fn player_digging_finish_cannot_break_bedrock() {
+        let state = GameServerState::shared_flat();
+        state.lock().unwrap().set_block(0, 63, 0, 7, 0);
+        let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player_digging(2, 0, 63, 0, 1));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(
+            BlockState::BEDROCK,
+            state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
+        );
+        assert!(
+            block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
+                x: 0,
+                y: 63,
+                z: 0,
+                block_type: 7,
                 metadata: 0,
             })
         );
@@ -2332,6 +4406,14 @@ mod tests {
 
         assert_eq!(SessionExit::ClientClosed, outcome);
         assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 63,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[36]
+        );
+        assert_eq!(
             BlockState::DIRT,
             state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
         );
@@ -2347,6 +4429,128 @@ mod tests {
     }
 
     #[test]
+    fn successful_placement_sends_set_slot_for_selected_hotbar_mapping() {
+        let state = GameServerState::shared_flat();
+        let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        input.extend(encoded_player(true));
+        input.extend(encoded_held_item_change(2));
+        input.extend(encoded_player_block_placement(0, 63, 0, 1, Some((5, 1, 0))));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 5,
+                count: 63,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[38]
+        );
+        assert_eq!(
+            BlockState::new_unchecked(5, 0),
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 38
+                && packet.slot_data
+                    == LegacySlotData::Present {
+                        item_id: 5,
+                        count: 63,
+                        damage: 0,
+                    }));
+    }
+
+    #[test]
+    fn rejected_placement_into_occupied_target_corrects_without_decrement() {
+        let state = GameServerState::shared_flat();
+        let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_held_item_change(3));
+        input.extend(encoded_player_block_placement(
+            0,
+            62,
+            0,
+            1,
+            Some((50, 1, 0)),
+        ));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 50,
+                count: 64,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[39]
+        );
+        assert_eq!(
+            BlockState::GRASS,
+            state.lock().unwrap().block_at(BlockPos::new(0, 63, 0))
+        );
+        let changes = block_changes(&stream.written);
+        assert!(changes.contains(&ClientboundBlockChangePacket {
+            x: 0,
+            y: 62,
+            z: 0,
+            block_type: 3,
+            metadata: 0,
+        }));
+        assert!(changes.contains(&ClientboundBlockChangePacket {
+            x: 0,
+            y: 63,
+            z: 0,
+            block_type: 2,
+            metadata: 0,
+        }));
+    }
+
+    #[test]
+    fn rejected_placement_does_not_decrement_selected_stack() {
+        let state = GameServerState::shared_flat();
+        let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_held_item_change(4));
+        input.extend(encoded_player_block_placement(
+            0,
+            63,
+            0,
+            1,
+            Some((270, 1, 0)),
+        ));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 270,
+                count: 1,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[40]
+        );
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+    }
+
+    #[test]
     fn special_item_use_placement_is_ignored_without_disconnect() {
         let mut session = PlayerSession::new(playable_config(0));
         let mut input = encoded_handshake("Luxorium");
@@ -2358,6 +4562,14 @@ mod tests {
 
         assert_eq!(SessionExit::ClientClosed, outcome);
         assert!(block_changes(&stream.written).is_empty());
+        assert_eq!(
+            LegacySlotData::Present {
+                item_id: 3,
+                count: 64,
+                damage: 0,
+            },
+            session.player().unwrap().inventory.slots()[36]
+        );
     }
 
     #[test]
@@ -2458,20 +4670,83 @@ mod tests {
     }
 
     #[test]
-    fn undocumented_chat_packet_disconnects_cleanly_without_panic() {
+    fn chat_commands_and_echo_respond_without_disconnect() {
         let mut session = PlayerSession::new(playable_config(0));
         let mut input = encoded_handshake("Luxorium");
         input.extend(encoded_login("Luxorium"));
-        input.push(0x03);
+        input.extend(encoded_player(true));
+        input.extend(encoded_chat("/aurelia"));
+        input.extend(encoded_chat("hello"));
         let mut stream = Duplex::new(input);
 
         let outcome = session.run(&mut stream).unwrap();
 
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        assert_eq!(ConnectionState::Joined, session.state());
+        let messages = chat_messages(&stream.written);
+        assert!(messages.iter().any(|message| message.contains("Aurelia")));
+        assert!(messages.iter().any(|message| message == "Luxorium: hello"));
+    }
+
+    #[test]
+    fn debug_chat_commands_mutate_world_time_and_inventory_safely() {
+        let state = GameServerState::shared_flat();
+        let mut session = PlayerSession::with_state(playable_config(0), Arc::clone(&state));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        input.extend(encoded_chat("/whereami"));
+        input.extend(encoded_chat("/givebasic"));
+        input.extend(encoded_chat("/setblock 1 70 1 3 0"));
+        input.extend(encoded_chat("/time 6000"));
+        input.extend(encoded_chat("/save"));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
         assert_eq!(
-            SessionExit::Disconnected(UNDOCUMENTED_PACKET_DISCONNECT.to_string()),
-            outcome
+            BlockState::DIRT,
+            state.lock().unwrap().block_at(BlockPos::new(1, 70, 1))
         );
-        assert_eq!(ConnectionState::Disconnected, session.state());
+        assert_eq!(6000, state.lock().unwrap().world_time());
+        let messages = chat_messages(&stream.written);
+        assert!(messages.iter().any(|message| message.contains("pos")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("Starter hotbar")));
+        assert!(messages.iter().any(|message| message.contains("Set block")));
+        assert!(messages.iter().any(|message| message.contains("Time set")));
+        assert!(messages.iter().any(|message| message.contains("Saved")));
+    }
+
+    #[test]
+    fn chat_command_bad_args_return_usage_without_panic() {
+        let mut session = PlayerSession::new(playable_config(0));
+        let mut input = encoded_handshake("Luxorium");
+        input.extend(encoded_login("Luxorium"));
+        input.extend(encoded_player(true));
+        input.extend(encoded_chat("/setblock 1 2"));
+        input.extend(encoded_chat("/setblock nope 2 3 4"));
+        input.extend(encoded_chat("/time nope"));
+        input.extend(encoded_chat("/time 1 2"));
+        let mut stream = Duplex::new(input);
+
+        let outcome = session.run(&mut stream).unwrap();
+
+        assert_eq!(SessionExit::ClientClosed, outcome);
+        let messages = chat_messages(&stream.written);
+        assert!(messages
+            .iter()
+            .any(|message| message == "Usage: /setblock x y z id [meta]"));
+        assert!(messages.iter().any(|message| message == "Invalid x."));
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.as_str() == "Usage: /time [value]")
+                .count()
+                >= 2
+        );
     }
 
     struct Duplex {
@@ -2546,6 +4821,12 @@ mod tests {
         .unwrap()
     }
 
+    fn encoded_player(on_ground: bool) -> Vec<u8> {
+        let mut bytes = vec![0x0A];
+        aurelia_protocol::write_bool(&mut bytes, on_ground).unwrap();
+        bytes
+    }
+
     fn encoded_player_position_look(
         x: f64,
         y: f64,
@@ -2583,6 +4864,59 @@ mod tests {
         let mut bytes = vec![ServerboundEntityActionPacket::ID];
         aurelia_protocol::write_i32(&mut bytes, entity_id).unwrap();
         aurelia_protocol::write_i8(&mut bytes, action_id).unwrap();
+        bytes
+    }
+
+    fn encoded_close_window(window_id: i8) -> Vec<u8> {
+        let packet = ServerboundCloseWindowPacket { window_id };
+        let mut bytes = vec![ServerboundCloseWindowPacket::ID];
+        packet.encode(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn encoded_window_click(
+        window_id: i8,
+        slot: i16,
+        mouse_button: i8,
+        action_number: i16,
+        shift: bool,
+        clicked_item: LegacySlotData,
+    ) -> Vec<u8> {
+        let packet = ServerboundWindowClickPacket {
+            window_id,
+            slot,
+            mouse_button,
+            action_number,
+            shift,
+            clicked_item,
+        };
+        let mut bytes = vec![ServerboundWindowClickPacket::ID];
+        packet.encode(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn encoded_confirm_transaction(window_id: i8, action_number: i16, accepted: bool) -> Vec<u8> {
+        let packet = ServerboundConfirmTransactionPacket {
+            window_id,
+            action_number,
+            accepted,
+        };
+        let mut bytes = vec![ServerboundConfirmTransactionPacket::ID];
+        packet.encode(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn encoded_chat(message: &str) -> Vec<u8> {
+        let mut bytes = vec![ChatPacket::ID];
+        ChatPacket::new(message).encode(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn encoded_keepalive(id: i32) -> Vec<u8> {
+        let mut bytes = vec![KeepAlivePacket::ID];
+        KeepAlivePacket { keep_alive_id: id }
+            .encode(&mut bytes)
+            .unwrap();
         bytes
     }
 
@@ -2626,6 +4960,51 @@ mod tests {
         &output[17 + compressed_size..]
     }
 
+    fn first_packet_position(bytes: &[u8], packet_id: u8) -> Option<usize> {
+        packet_positions(bytes, packet_id).into_iter().next()
+    }
+
+    fn first_packet_payload_length(bytes: &[u8], packet_id: u8) -> Option<usize> {
+        let position = first_packet_position(bytes, packet_id)?;
+        let frame = &bytes[position..];
+        let next = skip_clientbound_frame(frame)?;
+        Some(frame.len() - next.len() - 1)
+    }
+
+    fn packet_positions(bytes: &[u8], packet_id: u8) -> Vec<usize> {
+        let mut output = bytes;
+        let mut offset = 0;
+        let mut positions = Vec::new();
+        while !output.is_empty() {
+            if output[0] == packet_id {
+                positions.push(offset);
+            }
+            let Some(next) = skip_clientbound_frame(output) else {
+                panic!("unexpected packet id {:#04x}", output[0]);
+            };
+            offset += output.len() - next.len();
+            output = next;
+        }
+        positions
+    }
+
+    fn skip_clientbound_frame(output: &[u8]) -> Option<&[u8]> {
+        match output.first().copied()? {
+            id if id == HandshakePacket::ID => Some(&output[1 + 4..]),
+            id if id == ClientboundLoginResponsePacket::ID => Some(&output[1 + 15..]),
+            id if id == ClientboundSpawnPositionPacket::ID => Some(&output[1 + 12..]),
+            id if id == ClientboundPlayerPositionLookPacket::ID => Some(&output[1 + 41..]),
+            id if id == ClientboundChunkVisibilityPacket::ID => Some(&output[1 + 9..]),
+            id if id == ClientboundChunkDataPacket::ID => Some(skip_chunk_data_frame(output)),
+            id if id == ClientboundBlockChangePacket::ID => Some(&output[1 + 15..]),
+            id if id == DisconnectPacket::ID => {
+                let length = u16::from_be_bytes([output[1], output[2]]) as usize;
+                Some(&output[3 + (length * 2)..])
+            }
+            _ => skip_known_clientbound_frame(output),
+        }
+    }
+
     fn count_chunk_frames(bytes: &[u8]) -> (usize, usize) {
         let mut output = bytes;
         let mut visibility = 0;
@@ -2643,6 +5022,14 @@ mod tests {
                 }
                 ClientboundPlayerPositionLookPacket::ID => {
                     output = &output[1 + 41..];
+                }
+                ClientboundSetWindowItemsPacket::ID
+                | ClientboundSetSlotPacket::ID
+                | ClientboundBeta173TimeUpdatePacket::ID
+                | ChatPacket::ID
+                | KeepAlivePacket::ID
+                | ClientboundConfirmTransactionPacket::ID => {
+                    output = skip_known_clientbound_frame(output).unwrap();
                 }
                 ClientboundChunkVisibilityPacket::ID => {
                     visibility += 1;
@@ -2675,6 +5062,14 @@ mod tests {
                 ClientboundPlayerPositionLookPacket::ID => {
                     output = &output[1 + 41..];
                 }
+                ClientboundSetWindowItemsPacket::ID
+                | ClientboundSetSlotPacket::ID
+                | ClientboundBeta173TimeUpdatePacket::ID
+                | ChatPacket::ID
+                | KeepAlivePacket::ID
+                | ClientboundConfirmTransactionPacket::ID => {
+                    output = skip_known_clientbound_frame(output).unwrap();
+                }
                 ClientboundChunkVisibilityPacket::ID => {
                     output = &output[1 + 9..];
                 }
@@ -2696,6 +5091,99 @@ mod tests {
             }
         }
         changes
+    }
+
+    fn set_slot_packets(bytes: &[u8]) -> Vec<ClientboundSetSlotPacket> {
+        let mut output = bytes;
+        let mut packets = Vec::new();
+        while !output.is_empty() {
+            if output[0] == ClientboundSetSlotPacket::ID {
+                let window_id = output[1] as i8;
+                let slot = i16::from_be_bytes([output[2], output[3]]);
+                let item_id = i16::from_be_bytes([output[4], output[5]]);
+                let slot_data = if item_id == -1 {
+                    LegacySlotData::Empty
+                } else {
+                    LegacySlotData::Present {
+                        item_id,
+                        count: output[6],
+                        damage: i16::from_be_bytes([output[7], output[8]]),
+                    }
+                };
+                packets.push(ClientboundSetSlotPacket {
+                    window_id,
+                    slot,
+                    slot_data,
+                });
+            }
+            let Some(next) = skip_clientbound_frame(output) else {
+                panic!("unexpected packet id {:#04x}", output[0]);
+            };
+            output = next;
+        }
+        packets
+    }
+
+    fn chat_messages(bytes: &[u8]) -> Vec<String> {
+        let mut output = bytes;
+        let mut messages = Vec::new();
+        while !output.is_empty() {
+            if output[0] == ChatPacket::ID {
+                let length = u16::from_be_bytes([output[1], output[2]]) as usize;
+                let end = 3 + (length * 2);
+                let mut units = Vec::with_capacity(length);
+                for chunk in output[3..end].chunks_exact(2) {
+                    units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                }
+                messages.push(String::from_utf16_lossy(&units));
+                output = &output[end..];
+            } else if let Some(next) = skip_known_clientbound_frame(output) {
+                output = next;
+            } else if output[0] == ClientboundChunkDataPacket::ID {
+                output = skip_chunk_data_frame(output);
+            } else {
+                match output[0] {
+                    HandshakePacket::ID => output = &output[1 + 4..],
+                    ClientboundLoginResponsePacket::ID => output = &output[1 + 15..],
+                    ClientboundSpawnPositionPacket::ID => output = &output[1 + 12..],
+                    ClientboundPlayerPositionLookPacket::ID => output = &output[1 + 41..],
+                    ClientboundChunkVisibilityPacket::ID => output = &output[1 + 9..],
+                    ClientboundBlockChangePacket::ID => output = &output[1 + 15..],
+                    packet_id => panic!("unexpected packet id {packet_id:#04x}"),
+                }
+            }
+        }
+        messages
+    }
+
+    fn skip_known_clientbound_frame(output: &[u8]) -> Option<&[u8]> {
+        match output.first().copied()? {
+            id if id == ClientboundSetWindowItemsPacket::ID => {
+                let count = i16::from_be_bytes([output[2], output[3]]) as usize;
+                let mut index = 4;
+                for _ in 0..count {
+                    let item_id = i16::from_be_bytes([output[index], output[index + 1]]);
+                    index += 2;
+                    if item_id != -1 {
+                        index += 3;
+                    }
+                }
+                Some(&output[index..])
+            }
+            id if id == ClientboundSetSlotPacket::ID => {
+                let item_id = i16::from_be_bytes([output[4], output[5]]);
+                let len = if item_id == -1 { 6 } else { 9 };
+                Some(&output[len..])
+            }
+            id if id == ClientboundBeta173TimeUpdatePacket::ID => Some(&output[1 + 8..]),
+            id if id == ClientboundConfirmTransactionPacket::ID => Some(&output[1 + 4..]),
+            id if id == KeepAlivePacket::ID => Some(&output[1 + 4..]),
+            id if id == ChatPacket::ID => {
+                let length = u16::from_be_bytes([output[1], output[2]]) as usize;
+                Some(&output[3 + (length * 2)..])
+            }
+            _ => None,
+        }
     }
 
     fn decode_disconnect(bytes: &[u8]) -> String {
