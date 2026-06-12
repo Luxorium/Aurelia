@@ -1,6 +1,7 @@
 # Clean-Room Rules
 
-Aurelia must be an original implementation.
+Aurelia must be an original implementation. The canonical project policy is
+[CLEAN_ROOM_POLICY.md](CLEAN_ROOM_POLICY.md); this file is a short checklist.
 
 ## Hard Rules
 
@@ -8,6 +9,7 @@ Aurelia must be an original implementation.
 - Aurelia must not contain Minecraft assets.
 - Aurelia must not generate or distribute a Minecraft jar.
 - Aurelia must not copy decompiled Minecraft source.
+- Aurelia must not copy protocol code.
 - Aurelia must not copy Paper, Folia, Bukkit, Fabric, or Forge code.
 
 ## Reference Workflow

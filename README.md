@@ -1,66 +1,46 @@
 # Aurelia
 
-A clean-room, region-threaded Minecraft Beta 1.7.3 server rewrite in Rust.
+[![CI](https://github.com/Luxorium/Aurelia/actions/workflows/ci.yml/badge.svg)](https://github.com/Luxorium/Aurelia/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Aurelia is the base of an original Minecraft Beta 1.7.3-compatible dedicated
-server written from scratch in Rust. The long-term goal is for an original Beta
-1.7.3 client to connect, join a world, move, chat, receive chunks, break/place
-blocks, and play survival.
-
-## What Aurelia Is
-
-- An original dedicated server implementation.
-- A clean-room project targeting Beta 1.7.3 protocol and gameplay behavior.
-- A future region-threaded server inspired by Folia-style ownership,
-  schedulers, mailboxes, and thread checks.
-- A small Cargo workspace intended to grow carefully.
-
-## What Aurelia Is Not
-
-- It is not a fork of Minecraft, Bukkit, Paper, Folia, Fabric, or Forge.
-- It does not contain Mojang source code or assets.
-- It does not generate, distribute, or require committing a Minecraft jar.
-- It does not yet claim full Beta 1.7.3 client compatibility.
+Aurelia is a clean-room Minecraft Beta 1.7.3-compatible dedicated server rewrite in Rust, built toward a future region-threaded architecture.
 
 ## Current Status
 
-Aurelia is at the 0.2.0 Vanilla Parity Foundation stage. A real Beta 1.7.3
-client can join the experimental flat-world path, receive chunks, move, cross
-chunk boundaries with load/unload visibility updates, break and place blocks
-from a starter hotbar, run short chat/debug commands, click inventory slots
-conservatively, save dirty flat-world edits and basic player state, quit
-cleanly, and rejoin with saved edits. This is still an early parity foundation,
-not a complete Beta 1.7.3 server.
+Aurelia is currently at version `0.2.0`, the **Vanilla Parity Foundation** milestone.
 
-## Why Beta 1.7.3
+A real Beta 1.7.3 client can join the experimental flat-world path, receive chunks, move, cross chunk boundaries with chunk load/unload visibility updates, break and place blocks from a starter hotbar, use basic chat/debug commands, perform conservative inventory clicks, save dirty flat-world edits and basic player state, quit cleanly, and rejoin with saved edits.
 
-Beta 1.7.3 is a compact, well-understood Minecraft protocol and gameplay target
-with classic survival behavior. Its smaller scope makes it a practical version
-for building a compatible server from first principles before adding more
-complex systems.
+This is still an early compatibility foundation. Aurelia is not a complete Beta 1.7.3 server, and compatibility claims need clean-room evidence from tests, traces, public documentation, or independent observations.
 
-## Why Region-Threaded Design
+## What Works Today
 
-Aurelia is designed around eventual region ownership: chunks, entities, tile
-entities, block ticks, and local tasks should belong to a region and mutate only
-on that region's owning tick thread. Cross-region work should be posted through
-mailboxes. The first implementation uses fixed region sections and loud
-wrong-thread assertions.
+- Blocking TCP listener with per-connection player sessions.
+- Clean-room Beta 1.7.3 protocol `14` handshake and observed serverbound login decoding.
+- Experimental real-client join path behind `--experimental-join --playable-flat-world`.
+- Flat chunk generation and chunk visibility load/unload updates while crossing chunk boundaries.
+- Movement tracking, chat echo, and short debug commands.
+- Starter hotbar sync, held-slot tracking, and conservative player inventory window clicks.
+- Clean-room rule tables covering every Beta 1.7.3 block and item id, driving stack sizes, harvest requirements, and drops for survival break/place testing.
+- Dirty flat-world chunk persistence in an Aurelia-native format.
+- Basic player persistence for username, position, rotation, health, inventory, selected hotbar slot, and spawn position.
+- Server-side health/death/fall/void foundations without unverified client-visible health/death packet claims.
+- Unit and socket-level regression tests across the workspace.
 
-## External Reference Use
+## Not Yet Implemented
 
-External tools may be used separately as local reference workflows to study Beta
-1.7.3 behavior and compare behavior against the original game. They must not be
-copied into Aurelia, and decompiled Minecraft source must not be pasted into
-this repository.
+- Verified production login response semantics.
+- Full production chunk streaming policy.
+- Vanilla McRegion/NBT world and player save parity.
+- Vanilla terrain generation, caves, ores, trees, biomes, and structures.
+- Crafting, workbenches, chests, furnaces, and full inventory transaction behavior.
+- Item entities, pickups, overflow drops, mobs, AI, combat, and visible entity packets.
+- Exact digging timing, tool durability, collision, replaceable-block rules, permissions, and full survival loop.
+- Redstone, fluids, weather, sleep, vanilla commands, operators, and multiplayer edge cases.
 
-## Clean-Room Warning
+Current persistence is Aurelia-native and not vanilla McRegion/NBT-compatible.
 
-Do not include Mojang code, Minecraft assets, generated Minecraft jars, or
-decompiled Minecraft source in Aurelia. Contributors who inspect reference code
-should write behavior notes and then implement original code from those notes.
-
-## Build
+## Quick Start
 
 ```bash
 cargo fmt --all
@@ -68,137 +48,83 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-## Run
-
-```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565
-```
-
-The default run command binds to `0.0.0.0:25565` and keeps running until stopped.
-For a startup smoke test that exits immediately:
+Run a startup smoke test that binds to an ephemeral local port and exits:
 
 ```bash
 cargo run -p aurelia-server -- --smoke-test --host 127.0.0.1 --port 0
 ```
 
-For developer packet tracing while researching Beta 1.7.3 login bytes:
-
-```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --trace-packets
-```
-
-For trace-only continuation after the client handshake:
-
-```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --trace-packets --trace-packet-limit 8 --trace-continue-after-handshake
-```
-
-For the stable survival-session MVP:
-
-```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --playable-flat-world --trace-packets --trace-packet-limit 64
-```
-
-For real-client debugging with a larger trace window:
+Run the experimental real-client flat-world path:
 
 ```bash
 cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --playable-flat-world --chunk-radius 1 --compat-debug --trace-packets --trace-packet-limit 512
 ```
 
-The `beta173-observed` login response mode is the recommended experimental
-mode. The `mcdevs-legacy` mode is kept only as an alternate debug path; the
-latest client test reset the connection after that response.
+For a smoke test of the experimental path without keeping the server running:
 
 ```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --trace-packets --trace-packet-limit 64 --trace-continue-after-handshake --experimental-join --login-response-mode mcdevs-legacy
+cargo run -p aurelia-server -- --smoke-test --host 127.0.0.1 --port 0 --experimental-join --playable-flat-world
 ```
 
-`--playable-flat-world` currently sends chunk `(0,0)` and its neighbors by
-default. Use `--chunk-radius 0` to send only the spawn chunk if needed. Dirty
-flat-world chunks are saved under `<world>/aurelia-flat-v1/`. For login
-regression debugging, `--no-inventory-sync`, `--no-time-update`,
-`--time-update-mode off|once|interval`, `--no-keepalive`, and
-`--keepalive-mode off|serverbound-no-payload|serverbound-int32` isolate those
-compatibility surfaces. The default serverbound KeepAlive mode does not consume
-payload bytes until the Beta 1.7.3 return shape is verified. `--defer-inventory-sync`
-keeps starter inventory delayed until after several post-join movement packets
-(the current default), and `--post-join-minimal` suppresses optional post-join
-clientbound packets for core stream-alignment testing.
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for setup, tracing flags, compatibility-report guidance, and local testing notes.
 
-## What Works Now
+## Why Beta 1.7.3?
 
-- Blocking TCP listener with per-connection player sessions.
-- Shared game state with one flat world, entity manager, player registry, and
-  basic 20 TPS tick loop.
-- Handshake and observed serverbound login decoding.
-- Protocol version `14` check.
-- Provisional login response, spawn position, player position/look, chunk
-  visibility, and chunk data sends.
-- Initial join now sends chunk visibility/data before inventory sync, time
-  update, keepalive, or chat responses; Beta 1.7.3 time update is deferred
-  until the first client movement packet and starter inventory is delayed until
-  three additional movement packets.
-- Flat test world with grass at Y `63` and spawn air at Y `65`.
-- Chunk view tracking that sends missing chunks and `S->C 0x32` unload
-  visibility packets when a player changes chunks.
-- Periodic clientbound `0x00` keepalive while joined, with configurable
-  serverbound KeepAlive decoding. Beta 1.7.3 `0x04` TimeUpdate is sent once by
-  default and can be set to interval mode; Aurelia encodes it as one `i64`, not
-  the modern two-long layout.
-- Movement packet reads for `0x0A`, `0x0B`, `0x0C`, and `0x0D`.
-- Joined-state interaction packet reads for `0x10` held item change, `0x12`
-  animation, `0x13` entity action, `0x0E` digging, `0x0F` block placement,
-  `0x65` close window, `0x66` window click, and `0x6A` confirm transaction.
-- Serverbound chat `0x03`, clientbound chat responses, and debug commands:
-  `/aurelia`, `/whereami`, `/givebasic`, `/save`, `/setblock`, and `/time`.
-- Starter hotbar sync through `S->C 0x68 SetWindowItems`, slot corrections
-  through `S->C 0x67 SetSlot`, and conservative window-click confirmation.
-- Player inventory window `0` maps hotbar indices `0..=8` to window slots
-  `36..=44`.
-- Beta 1.7.3 item metadata for early survival stack limits, placeable blocks,
-  and basic tool categories.
-- Beta 1.7.3 block metadata for early survival materials, approximate
-  hardness, preferred/required tools, light placeholders, and drops.
-- Inventory-backed block placement in visible loaded chunks. Successful
-  placement decrements the selected server-side hotbar stack; rejected
-  placement sends block corrections plus selected-slot `SetSlot` and does not
-  consume items.
-- Rule-driven block breaking uses an active digging state, prevents bedrock
-  edits, sends `S->C 0x35 BlockChange`, applies held-tool harvest rules, and
-  adds drops to inventory when space is available without duplicating
-  full-inventory drops.
-- Dirty modified chunks are saved and reloaded in an Aurelia-native MVP format.
-- Basic server-side player state, survival mode marker, health/death state,
-  fall/void damage foundation, respawn helper, block get/set/break/place world
-  APIs, selected hotbar slot, crouch flag, world time counter, and entity/mob
-  scaffolding.
-- Aurelia-native player persistence for username, position, rotation, health,
-  inventory, and spawn position.
-- A vanilla parity matrix in `docs/VANILLA_PARITY_MATRIX.md`.
+Beta 1.7.3 is a compact and historically important Minecraft version with a smaller protocol and gameplay surface than modern releases. That makes it a realistic target for clean-room compatibility work: behavior can be studied, documented, tested, and implemented carefully before expanding into more complex systems.
 
-## Not Yet Implemented
+## Why Rust?
 
-- Verified production login response semantics.
-- Full production chunk streaming policy beyond the conservative radius-based
-  MVP.
-- Crafting, smelting, chests, workbench UI, and full inventory rules.
-- Item entities for overflow drops and pickups.
-- Placement remains conservative: no replaceable-block table beyond air
-  targets, no collision checks, no tool-speed timing, and no full interaction
-  semantics for use-on-block items yet.
-- Client-visible health/death/respawn packet sync is not verified; health is
-  currently server-side foundation only.
-- Tool durability, exact break timing, permissions, and full survival loop.
-- Visible mob spawn packets, AI, pathfinding, combat, and mob persistence.
-- Vanilla McRegion/NBT world and player save parity. Current persistence is
-  Aurelia-native.
+Rust gives Aurelia memory safety, explicit ownership boundaries, strong testability, and predictable performance without a garbage-collected runtime. Those properties fit a long-running server where networking, world state, persistence, and eventual region ownership need to stay understandable under load.
+
+## Why Region-Threaded?
+
+The long-term architecture is region-threaded: chunks, entities, tile entities, scheduled block ticks, and local tasks should be owned by a region and mutated only by that region's tick thread. Cross-region work should go through mailboxes.
+
+The current implementation is still an early foundation. The `aurelia-region` crate exists to grow the ownership model deliberately while the protocol and world layers become useful enough to test with real clients.
+
+## Workspace Crates
+
+- [`aurelia-common`](aurelia-common) - shared coordinate types, chunk-view helpers, and early Beta 1.7.3 item rules.
+- [`aurelia-protocol`](aurelia-protocol) - clean-room packet models, codecs, trace metadata, and Beta 1.7.3 protocol constants.
+- [`aurelia-world`](aurelia-world) - flat-world chunks, block rules, world APIs, entity scaffolding, and Aurelia-native persistence.
+- [`aurelia-region`](aurelia-region) - future region ownership and scheduling foundation.
+- [`aurelia-server`](aurelia-server) - server configuration, TCP listener, player session loop, experimental join path, commands, inventory handling, and persistence integration.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a fuller overview.
+
+## Compatibility
+
+- [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) tracks the current client-visible compatibility surface.
+- [docs/VANILLA_PARITY_MATRIX.md](docs/VANILLA_PARITY_MATRIX.md) tracks areas of vanilla behavior, current status, gaps, and test strategy.
 
 ## Roadmap Summary
 
-- 0.1.x: Real-client join and playable flat-world MVP.
-- 0.2.x: Vanilla survival mechanics foundation.
-- 0.3.x: Containers, crafting, and furnaces.
-- 0.4.x: Vanilla terrain/worldgen plus McRegion/NBT parity.
-- 0.5.x: Entities, item entities, and mobs.
-- Later: redstone, fluids, weather, commands, multiplayer edge cases, and full
-  vanilla parity.
+- `0.2.x`: harden the Vanilla Parity Foundation, verify login semantics, expand block/item rules, and add item entities.
+- `0.3.x`: containers, crafting, workbench UI, furnaces, and fuller inventory behavior.
+- `0.4.x`: vanilla-style terrain/worldgen and McRegion/NBT parity.
+- `0.5.x`: item entities, visible entity packets, passive animals, hostile mobs, AI, drops, and combat.
+- Later: redstone, fluids, weather, sleep, commands, permissions, multiplayer edge cases, and broader parity audits.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full roadmap.
+
+## Clean-Room Policy
+
+Aurelia is an original implementation. Do not commit Mojang source code, Minecraft assets, generated jars, decompiled source, copied protocol code, or copied implementations from Minecraft server/modding projects.
+
+Allowed references include public documentation, black-box packet traces, original observations, independently written behavior notes, and tests written from clean evidence. Read [docs/CLEAN_ROOM_POLICY.md](docs/CLEAN_ROOM_POLICY.md) before contributing compatibility work.
+
+## Contributing
+
+Contributions are welcome when they keep the project honest, testable, and legally clean. Start with [CONTRIBUTING.md](CONTRIBUTING.md), then check [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for local workflow details.
+
+Good early contribution areas include documentation, compatibility traces, focused protocol tests, block/item rule coverage, world persistence tests, and narrow survival-system work that does not overclaim vanilla parity.
+
+## Sponsorship And Support
+
+Sponsorship helps fund clean-room protocol research, compatibility testing, documentation, hosting/build infrastructure, and long-term development time. See [docs/SPONSORSHIP.md](docs/SPONSORSHIP.md) for details.
+
+## Legal And Trademark Notice
+
+Aurelia is unofficial and is not affiliated with Mojang, Microsoft, or Minecraft. Minecraft is a trademark of its respective owners.
+
+This repository does not contain Mojang source code, Minecraft assets, generated Minecraft jars, decompiled Minecraft source, or copied server/modding project code. Compatibility work must remain clean-room and independently implemented.

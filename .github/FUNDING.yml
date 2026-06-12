@@ -1,0 +1,5 @@
+# Verify that the Luxorium account is enrolled in GitHub Sponsors before
+# expecting the sponsorship button to appear publicly.
+# Do not add Patreon, Ko-fi, PayPal, OpenCollective, or custom funding URLs
+# unless those accounts are intentionally created and maintained.
+github: Luxorium

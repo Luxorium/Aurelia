@@ -1,6 +1,8 @@
 # Beta 1.7.3 Protocol Notes
 
-This document records clean-room protocol assumptions and implementation status.
+This document records clean-room protocol assumptions and implementation status for Aurelia `0.2.0` / Vanilla Parity Foundation.
+
+Protocol notes are not permission to copy protocol code from Mojang or other server/modding projects. Use public documentation, black-box traces, original observations, independent notes, and tests.
 
 ## Scope
 

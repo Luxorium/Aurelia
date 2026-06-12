@@ -1,0 +1,52 @@
+name: Feature Request
+description: Suggest a focused improvement or compatibility area.
+title: "Feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Or Use Case
+      description: What should Aurelia be able to do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Scope
+      description: Keep the request narrow enough to test and review.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - protocol
+        - compatibility
+        - world
+        - inventory
+        - entities
+        - region-threading
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Clean-Room Evidence Or References
+      description: Public docs, black-box observations, traces, or original notes.
+  - type: textarea
+    id: tests
+    attributes:
+      label: Suggested Tests
+      description: How could this be verified?
+  - type: checkboxes
+    id: clean_room
+    attributes:
+      label: Clean-Room Confirmation
+      options:
+        - label: This request does not require committing Mojang source code, Minecraft assets, generated jars, decompiled source, or copied server/modding project code.
+          required: true

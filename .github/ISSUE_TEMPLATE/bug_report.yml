@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a reproducible Aurelia bug.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not attach Mojang source code, Minecraft assets, generated jars, decompiled source, copied protocol code, or secrets.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction Steps
+      description: Provide exact commands and steps.
+      placeholder: |
+        1. Run ...
+        2. Connect ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aurelia Version Or Commit
+      placeholder: "0.2.0, main@<sha>, or local branch"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "OS, Rust version, client version if relevant"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs Or Traces
+      description: Paste relevant output with secrets redacted.
+      render: text
+  - type: checkboxes
+    id: clean_room
+    attributes:
+      label: Clean-Room Confirmation
+      options:
+        - label: I have not included Mojang source code, Minecraft assets, generated jars, decompiled source, copied protocol code, or secrets.
+          required: true

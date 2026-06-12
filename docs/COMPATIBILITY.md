@@ -1,7 +1,12 @@
 # Compatibility
 
-Aurelia targets eventual compatibility with original Minecraft Beta 1.7.3
-clients.
+Aurelia targets eventual compatibility with original Minecraft Beta 1.7.3 clients.
+
+Current project version: `0.2.0`.
+
+Current milestone: **Vanilla Parity Foundation**.
+
+Aurelia is unofficial and is not affiliated with Mojang, Microsoft, or Minecraft. This document tracks clean-room compatibility evidence and known gaps; it is not a claim of complete server parity.
 
 ## Current State
 
@@ -33,10 +38,15 @@ clients.
   decoded and drained without disconnecting.
 - Digging `0x0E` and placement `0x0F` are decoded for inventory-backed MVP
   break/place behavior in visible loaded chunks.
-- Early Beta 1.7.3 item and block rule tables drive stack sizes, placeable
-  checks, basic tool categories, harvest requirements, and drops for common
-  survival blocks/items. Some hardness values are approximate and isolated for
-  later correction.
+- Complete Beta 1.7.3 item and block rule tables drive stack sizes, placeable
+  checks, tool categories/tiers, harvest requirements, drops, solidity, and
+  light emission for every block id `0..=96` and item id `256..=357` plus both
+  music discs. Values from public documentation are isolated and marked
+  approximate for later trace correction.
+- Technical block forms (fluids, fire, the block forms of doors, signs, beds,
+  repeaters, sugar cane, and cake, piston internals, and portal) are classified
+  as never placeable from an inventory stack, so a hostile client cannot place
+  them by claiming the block id as a held item.
 - Placement handles the Beta item-use-in-air sentinel
   `x=-1,y=255,z=-1,face=-1` without mutation or disconnecting, and sends a
   held-slot `SetSlot` correction when inventory sync is enabled.
@@ -75,8 +85,7 @@ clients.
   replaceable-block table, collision checks, or full use-on-block item behavior
   yet.
 
-The current repository is a playable-test foundation, not a compatibility
-claim.
+The current repository is an early playable-test foundation, not a complete compatibility claim.
 
 ## Manual 0.2.0 Acceptance Checklist
 
@@ -122,10 +131,12 @@ not Anvil, McRegion, NBT, or vanilla-compatible save formats.
 - Compatibility claims must be backed by tests or documented observations.
 - Behavior notes should be written cleanly and independently.
 - Implementation code must stay original.
+- Do not include Mojang source code, Minecraft assets, generated jars, decompiled source, copied protocol code, or copied server/modding project implementations.
+- Current persistence is Aurelia-native and not vanilla McRegion/NBT.
 
 ## TODOs
 
 - Track protocol compatibility by packet.
 - Track world compatibility by client-visible behavior.
 - Track survival compatibility by gameplay system.
-- Add manual client test notes once networking exists.
+- Add clean manual client test notes as real-client behavior is verified.

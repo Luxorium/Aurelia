@@ -1,0 +1,59 @@
+name: Compatibility Trace
+description: Share clean-room real-client behavior evidence.
+title: "Compatibility: "
+labels:
+  - compatibility
+  - needs-trace
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for clean Beta 1.7.3 client observations. Do not paste decompiled source, proprietary assets, generated jars, copied protocol code, session tokens, or secrets.
+  - type: input
+    id: aurelia_version
+    attributes:
+      label: Aurelia Version Or Commit
+      placeholder: "0.2.0, main@<sha>, or local branch"
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client Version
+      placeholder: "Clean Minecraft Beta 1.7.3 client"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Server Command
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed Client Behavior
+      description: Describe the screen state, disconnect message, movement, chunks, inventory, or gameplay behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: Aurelia Trace Output
+      description: Paste relevant trace lines with secrets redacted.
+      render: text
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior Or Comparison
+      description: If comparing to vanilla, describe black-box observations in your own words.
+  - type: checkboxes
+    id: clean_room
+    attributes:
+      label: Clean-Room Confirmation
+      options:
+        - label: These notes are based on public documentation, black-box traces, original observations, or independently written behavior notes.
+          required: true
+        - label: I have not included Mojang source code, Minecraft assets, generated jars, decompiled source, copied protocol code, or secrets.
+          required: true

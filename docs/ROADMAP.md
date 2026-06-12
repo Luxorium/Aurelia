@@ -1,41 +1,31 @@
 # Roadmap
 
-This roadmap treats Aurelia as a clean-room path toward vanilla Minecraft Beta
-1.7.3 behavior from the client/player point of view. The scope remains
-conservative: only claim parity for behavior implemented and tested from public
-documentation, packet traces, black-box testing, or original reasoning.
+This roadmap treats Aurelia as a clean-room path toward Minecraft Beta 1.7.3 behavior from the client/player point of view. The scope is conservative: only claim parity for behavior implemented and tested from public documentation, packet traces, black-box testing, or original reasoning.
 
-## 0.1.x - Real-Client Join And Playable Flat-World MVP
+## Current Milestone: 0.2.0 - Vanilla Parity Foundation
 
-- Cargo workspace, server startup, protocol/world/region scaffolding.
-- Experimental real-client login path for protocol 14.
-- Flat-world chunk streaming with visibility load/unload packets.
-- Movement, chat/debug commands, keepalive/time basics.
-- Starter inventory sync, conservative inventory clicks, block break/place MVP.
-- Aurelia-native dirty chunk persistence and rejoin support.
+The current milestone proves an early real-client foundation:
 
-Remaining 0.1.x validation:
+- Experimental Beta 1.7.3 real-client flat-world join path.
+- Chunk visibility/data sends and chunk load/unload updates while crossing chunk boundaries.
+- Movement, chat/debug commands, keepalive/time basics, and packet tracing.
+- Starter hotbar sync, conservative inventory clicks, and block break/place MVP behavior.
+- Early Beta 1.7.3 block/item rule tables.
+- Server-side health/death/fall/void foundations.
+- Aurelia-native dirty chunk and basic player persistence.
 
-- Keep current join ordering stable.
-- Continue real-client trace checks for packet ordering and chunk behavior.
+This milestone is not a full compatibility claim.
 
-## 0.2.x - Vanilla Survival Mechanics Foundation
+## 0.2.x - Foundation Hardening
 
-- Vanilla parity matrix.
-- Early Beta 1.7.3 item stack/tool metadata.
-- Early block material, hardness, harvest, and drop rules.
-- Rule-driven survival block breaking and placement.
-- Server-side health/death/respawn foundation.
-- Aurelia-native player persistence for position, rotation, health, inventory,
-  and spawn position.
-
-TODO:
-
-- Verify client-visible health/death/respawn packets before sending them.
-- Add tool durability and timed digging.
-- Add item entities for overflow drops and pickups.
+- Verify production login response semantics from clean clientbound evidence.
+- Stabilize current join ordering and chunk streaming behavior.
 - Expand block and item rule coverage.
-- Add collision and replaceable-block semantics.
+- Add tool durability and timed digging.
+- Add replaceable-block and collision semantics for placement.
+- Add item entities for overflow drops and pickups.
+- Verify client-visible health/death/respawn packets before sending them.
+- Improve persistence tests for Aurelia-native chunk and player formats.
 
 ## 0.3.x - Containers, Crafting, And Furnaces
 
@@ -67,3 +57,9 @@ TODO:
 - Vanilla commands/operator behavior.
 - Multiplayer edge cases and permissions.
 - Full protocol and gameplay parity audit against clean black-box traces.
+
+## Ongoing Requirements
+
+- Keep clean-room warnings visible.
+- Keep compatibility docs aligned with actual real-client evidence.
+- Avoid committing Mojang code, Minecraft assets, generated jars, decompiled source, copied protocol code, or copied server/modding project implementations.

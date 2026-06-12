@@ -1,13 +1,17 @@
 # Beta 1.7.3 Login Research
 
 This document tracks login packet questions that must be answered before Aurelia
-implements a login codec or claims real Beta 1.7.3 client compatibility.
+promotes provisional login behavior to supported Beta 1.7.3 compatibility.
+
+All research must stay clean-room. Do not use or paste Mojang source code,
+Minecraft assets, generated jars, decompiled source, copied protocol code, or
+copied server/modding project implementations.
 
 ## Current Position
 
 Aurelia expects the Beta 1.7.3 protocol version to be `14`. The observed
 serverbound login trace confirms the client sent this value. The Rust protocol
-crate exposes it as `BETA_173_PROTOCOL_VERSION`.
+crate exposes it as `EXPECTED_PROTOCOL_VERSION`.
 
 `ServerboundLoginPacket` is now the observed client-to-server login model.
 `PacketCodecRegistry` metadata names `C->S 0x01` as `Login` separately from
@@ -17,7 +21,7 @@ spawn position,
 player position/look, chunk visibility, and chunk data. The `beta173-observed`
 mode is now the recommended experimental mode because a real client accepted it
 far enough to send movement packets. These packets are still not verified as
-supported compatibility.
+supported production compatibility.
 
 ## Known Flow
 

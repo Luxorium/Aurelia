@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Clean-Room Policy
+    url: https://github.com/Luxorium/Aurelia/blob/main/docs/CLEAN_ROOM_POLICY.md
+    about: Read the allowed and forbidden reference policy before sharing compatibility evidence.
+  - name: Development Guide
+    url: https://github.com/Luxorium/Aurelia/blob/main/docs/DEVELOPMENT.md
+    about: Local setup, test commands, tracing flags, and report guidance.
