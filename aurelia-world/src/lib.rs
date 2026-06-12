@@ -24,6 +24,22 @@ pub mod beta173 {
         Decoration,
         Container,
         Unbreakable,
+        Fluid,
+        Plant,
+        Metal,
+        Cloth,
+        Snow,
+        Ice,
+        Clay,
+        Web,
+        Explosive,
+        Circuit,
+        Cake,
+        Sponge,
+        Cactus,
+        Fire,
+        Portal,
+        Vegetable,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -301,7 +317,7 @@ pub mod beta173 {
                 BlockDrop::SelfItem,
                 true,
             ),
-            item::DIAMOND_ORE => ore(id, "diamond_ore", item::DIAMOND_ORE, ToolTier::Iron),
+            item::DIAMOND_ORE => ore(id, "diamond_ore", item::DIAMOND, ToolTier::Iron),
             item::CRAFTING_TABLE => rule(
                 id,
                 "crafting_table",
@@ -336,9 +352,716 @@ pub mod beta173 {
                 },
                 true,
             ),
-            item::REDSTONE_ORE | item::GLOWING_REDSTONE_ORE => {
-                ore(id, "redstone_ore", item::REDSTONE_ORE, ToolTier::Iron)
+            item::REDSTONE_ORE | item::GLOWING_REDSTONE_ORE => rule(
+                id,
+                "redstone_ore",
+                Material::Rock,
+                3.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Iron),
+                true,
+                false,
+                if i16::from(id) == item::GLOWING_REDSTONE_ORE {
+                    9
+                } else {
+                    0
+                },
+                BlockDrop::RequiresTool {
+                    item_id: item::REDSTONE,
+                    count: 4,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::SAPLING => plant(id, "sapling", BlockDrop::SelfItem),
+            item::WATER | item::STATIONARY_WATER => rule(
+                id,
+                "water",
+                Material::Fluid,
+                100.0,
+                None,
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::LAVA | item::STATIONARY_LAVA => rule(
+                id,
+                "lava",
+                Material::Fluid,
+                100.0,
+                None,
+                None,
+                false,
+                true,
+                15,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::SPONGE => rule(
+                id,
+                "sponge",
+                Material::Sponge,
+                0.6,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::LAPIS_ORE => rule(
+                id,
+                "lapis_ore",
+                Material::Rock,
+                3.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Stone),
+                true,
+                false,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::DYE,
+                    count: 4,
+                    damage: 4,
+                },
+                true,
+            ),
+            item::LAPIS_BLOCK => {
+                pick_block(id, "lapis_block", Material::Rock, 3.0, ToolTier::Stone)
             }
+            item::DISPENSER => pick_block(id, "dispenser", Material::Rock, 3.5, ToolTier::Wood),
+            item::SANDSTONE => pick_block(id, "sandstone", Material::Rock, 0.8, ToolTier::Wood),
+            item::NOTE_BLOCK => wood_block(id, "note_block", 0.8),
+            item::BED_BLOCK => rule(
+                id,
+                "bed",
+                Material::Cloth,
+                0.2,
+                None,
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Item {
+                    item_id: item::BED,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::RAIL => circuit(id, "rail", 0.7, 0, BlockDrop::SelfItem),
+            item::POWERED_RAIL => circuit(id, "powered_rail", 0.7, 0, BlockDrop::SelfItem),
+            item::DETECTOR_RAIL => circuit(id, "detector_rail", 0.7, 0, BlockDrop::SelfItem),
+            item::STICKY_PISTON => rule(
+                id,
+                "sticky_piston",
+                Material::Rock,
+                0.5,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::PISTON => rule(
+                id,
+                "piston",
+                Material::Rock,
+                0.5,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::PISTON_HEAD => rule(
+                id,
+                "piston_head",
+                Material::Rock,
+                0.5,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::PISTON_MOVING => rule(
+                id,
+                "piston_moving",
+                Material::Rock,
+                -1.0,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::COBWEB => rule(
+                id,
+                "cobweb",
+                Material::Web,
+                4.0,
+                None,
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::TALL_GRASS => plant(id, "tall_grass", BlockDrop::Nothing),
+            item::DEAD_BUSH => plant(id, "dead_bush", BlockDrop::Nothing),
+            item::WOOL => rule(
+                id,
+                "wool",
+                Material::Cloth,
+                0.8,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::DANDELION => plant(id, "dandelion", BlockDrop::SelfItem),
+            item::ROSE => plant(id, "rose", BlockDrop::SelfItem),
+            item::RED_MUSHROOM => plant(id, "red_mushroom", BlockDrop::SelfItem),
+            item::BROWN_MUSHROOM => rule(
+                id,
+                "brown_mushroom",
+                Material::Plant,
+                0.0,
+                None,
+                None,
+                false,
+                true,
+                1,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::GOLD_BLOCK => pick_block(id, "gold_block", Material::Metal, 3.0, ToolTier::Iron),
+            item::IRON_BLOCK => pick_block(id, "iron_block", Material::Metal, 5.0, ToolTier::Stone),
+            item::DIAMOND_BLOCK => {
+                pick_block(id, "diamond_block", Material::Metal, 5.0, ToolTier::Iron)
+            }
+            item::DOUBLE_STONE_SLAB => rule(
+                id,
+                "double_stone_slab",
+                Material::Rock,
+                2.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                false,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::STONE_SLAB,
+                    count: 2,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::STONE_SLAB => rule(
+                id,
+                "stone_slab",
+                Material::Rock,
+                2.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                true,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::STONE_SLAB,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::BRICKS => pick_block(id, "bricks", Material::Rock, 2.0, ToolTier::Wood),
+            item::TNT => rule(
+                id,
+                "tnt",
+                Material::Explosive,
+                0.0,
+                None,
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::BOOKSHELF => rule(
+                id,
+                "bookshelf",
+                Material::Wood,
+                1.5,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::MOSSY_COBBLESTONE => {
+                pick_block(id, "mossy_cobblestone", Material::Rock, 2.0, ToolTier::Wood)
+            }
+            item::OBSIDIAN => pick_block(id, "obsidian", Material::Rock, 10.0, ToolTier::Diamond),
+            item::FIRE => rule(
+                id,
+                "fire",
+                Material::Fire,
+                0.0,
+                None,
+                None,
+                false,
+                true,
+                15,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::MOB_SPAWNER => rule(
+                id,
+                "mob_spawner",
+                Material::Rock,
+                5.0,
+                Some(ToolCategory::Pickaxe),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::WOODEN_STAIRS => rule(
+                id,
+                "wooden_stairs",
+                Material::Wood,
+                2.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::COBBLESTONE_STAIRS => rule(
+                id,
+                "cobblestone_stairs",
+                Material::Rock,
+                2.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                true,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::COBBLESTONE_STAIRS,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::REDSTONE_WIRE => circuit(
+                id,
+                "redstone_wire",
+                0.0,
+                0,
+                BlockDrop::Item {
+                    item_id: item::REDSTONE,
+                    count: 1,
+                    damage: 0,
+                },
+            ),
+            item::CROPS => plant(
+                id,
+                "crops",
+                BlockDrop::Item {
+                    item_id: item::SEEDS,
+                    count: 1,
+                    damage: 0,
+                },
+            ),
+            item::FARMLAND => rule(
+                id,
+                "farmland",
+                Material::Dirt,
+                0.6,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Item {
+                    item_id: item::DIRT,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::SIGN_POST | item::WALL_SIGN => rule(
+                id,
+                "sign",
+                Material::Wood,
+                1.0,
+                Some(ToolCategory::Axe),
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::Item {
+                    item_id: item::SIGN,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::WOODEN_DOOR_BLOCK => rule(
+                id,
+                "wooden_door",
+                Material::Wood,
+                3.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Item {
+                    item_id: item::WOODEN_DOOR,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::IRON_DOOR_BLOCK => rule(
+                id,
+                "iron_door",
+                Material::Metal,
+                5.0,
+                Some(ToolCategory::Pickaxe),
+                Some(ToolTier::Wood),
+                true,
+                true,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::IRON_DOOR,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::LADDER => rule(
+                id,
+                "ladder",
+                Material::Decoration,
+                0.4,
+                None,
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::LEVER => circuit(id, "lever", 0.5, 0, BlockDrop::SelfItem),
+            item::STONE_PRESSURE_PLATE => rule(
+                id,
+                "stone_pressure_plate",
+                Material::Rock,
+                0.5,
+                Some(ToolCategory::Pickaxe),
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::WOODEN_PRESSURE_PLATE => rule(
+                id,
+                "wooden_pressure_plate",
+                Material::Wood,
+                0.5,
+                Some(ToolCategory::Axe),
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::REDSTONE_TORCH_OFF => circuit(
+                id,
+                "redstone_torch_off",
+                0.0,
+                0,
+                BlockDrop::Item {
+                    item_id: item::REDSTONE_TORCH,
+                    count: 1,
+                    damage: 0,
+                },
+            ),
+            item::REDSTONE_TORCH => circuit(id, "redstone_torch", 0.0, 7, BlockDrop::SelfItem),
+            item::STONE_BUTTON => rule(
+                id,
+                "stone_button",
+                Material::Rock,
+                0.5,
+                None,
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::SNOW_LAYER => rule(
+                id,
+                "snow_layer",
+                Material::Snow,
+                0.1,
+                Some(ToolCategory::Shovel),
+                None,
+                false,
+                true,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::SNOWBALL,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::ICE => rule(
+                id,
+                "ice",
+                Material::Ice,
+                0.5,
+                Some(ToolCategory::Pickaxe),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::SNOW_BLOCK => rule(
+                id,
+                "snow_block",
+                Material::Snow,
+                0.2,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::RequiresTool {
+                    item_id: item::SNOWBALL,
+                    count: 4,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::CACTUS => rule(
+                id,
+                "cactus",
+                Material::Cactus,
+                0.4,
+                None,
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::CLAY_BLOCK => rule(
+                id,
+                "clay_block",
+                Material::Clay,
+                0.6,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::Item {
+                    item_id: item::CLAY_BALL,
+                    count: 4,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::SUGAR_CANE_BLOCK => plant(
+                id,
+                "sugar_cane",
+                BlockDrop::Item {
+                    item_id: item::SUGAR_CANE,
+                    count: 1,
+                    damage: 0,
+                },
+            ),
+            item::JUKEBOX => wood_block(id, "jukebox", 2.0),
+            item::FENCE => rule(
+                id,
+                "fence",
+                Material::Wood,
+                2.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::PUMPKIN => rule(
+                id,
+                "pumpkin",
+                Material::Vegetable,
+                1.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::JACK_O_LANTERN => rule(
+                id,
+                "jack_o_lantern",
+                Material::Vegetable,
+                1.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                false,
+                15,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::NETHERRACK => pick_block(id, "netherrack", Material::Rock, 0.4, ToolTier::Wood),
+            item::SOUL_SAND => rule(
+                id,
+                "soul_sand",
+                Material::Sand,
+                0.5,
+                Some(ToolCategory::Shovel),
+                None,
+                true,
+                false,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
+            item::GLOWSTONE => rule(
+                id,
+                "glowstone",
+                Material::Glass,
+                0.3,
+                None,
+                None,
+                true,
+                true,
+                15,
+                BlockDrop::Item {
+                    item_id: item::GLOWSTONE_DUST,
+                    count: 1,
+                    damage: 0,
+                },
+                true,
+            ),
+            item::PORTAL => rule(
+                id,
+                "portal",
+                Material::Portal,
+                -1.0,
+                None,
+                None,
+                false,
+                true,
+                11,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::CAKE_BLOCK => rule(
+                id,
+                "cake",
+                Material::Cake,
+                0.5,
+                None,
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::REPEATER_OFF => circuit(
+                id,
+                "repeater_off",
+                0.0,
+                0,
+                BlockDrop::Item {
+                    item_id: item::REPEATER,
+                    count: 1,
+                    damage: 0,
+                },
+            ),
+            item::REPEATER_ON => circuit(
+                id,
+                "repeater_on",
+                0.0,
+                9,
+                BlockDrop::Item {
+                    item_id: item::REPEATER,
+                    count: 1,
+                    damage: 0,
+                },
+            ),
+            item::LOCKED_CHEST => rule(
+                id,
+                "locked_chest",
+                Material::Container,
+                0.0,
+                None,
+                None,
+                true,
+                false,
+                15,
+                BlockDrop::Nothing,
+                true,
+            ),
+            item::TRAPDOOR => rule(
+                id,
+                "trapdoor",
+                Material::Wood,
+                3.0,
+                Some(ToolCategory::Axe),
+                None,
+                true,
+                true,
+                0,
+                BlockDrop::SelfItem,
+                true,
+            ),
             _ => rule(
                 id,
                 "unknown",
@@ -353,6 +1076,80 @@ pub mod beta173 {
                 true,
             ),
         }
+    }
+
+    fn pick_block(
+        id: u8,
+        name: &'static str,
+        material: Material,
+        hardness: f32,
+        tier: ToolTier,
+    ) -> BlockRule {
+        rule(
+            id,
+            name,
+            material,
+            hardness,
+            Some(ToolCategory::Pickaxe),
+            Some(tier),
+            true,
+            false,
+            0,
+            BlockDrop::RequiresTool {
+                item_id: i16::from(id),
+                count: 1,
+                damage: 0,
+            },
+            true,
+        )
+    }
+
+    fn wood_block(id: u8, name: &'static str, hardness: f32) -> BlockRule {
+        rule(
+            id,
+            name,
+            Material::Wood,
+            hardness,
+            Some(ToolCategory::Axe),
+            None,
+            true,
+            false,
+            0,
+            BlockDrop::SelfItem,
+            true,
+        )
+    }
+
+    fn plant(id: u8, name: &'static str, drop: BlockDrop) -> BlockRule {
+        rule(
+            id,
+            name,
+            Material::Plant,
+            0.0,
+            None,
+            None,
+            false,
+            true,
+            0,
+            drop,
+            true,
+        )
+    }
+
+    fn circuit(id: u8, name: &'static str, hardness: f32, light: u8, drop: BlockDrop) -> BlockRule {
+        rule(
+            id,
+            name,
+            Material::Circuit,
+            hardness,
+            None,
+            None,
+            false,
+            true,
+            light,
+            drop,
+            true,
+        )
     }
 
     fn ore(id: u8, name: &'static str, item_id: i16, tier: ToolTier) -> BlockRule {
@@ -1055,6 +1852,88 @@ mod tests {
             Some((15, 1, 0)),
             iron_ore.drop_for(Some(aurelia_common::beta173::item_rule(274)), 0)
         );
+    }
+
+    #[test]
+    fn beta173_block_rules_cover_every_block_id() {
+        for id in 1..=aurelia_common::beta173::MAX_BLOCK_ID {
+            let rule = beta173::block_rule(id as u8);
+            assert_ne!(
+                "unknown", rule.debug_name,
+                "block id {id} is missing a rule"
+            );
+        }
+    }
+
+    #[test]
+    fn beta173_block_drops_match_documented_behavior() {
+        use aurelia_common::beta173 as item;
+
+        let diamond_ore = beta173::block_rule(item::DIAMOND_ORE as u8);
+        assert_eq!(
+            None,
+            diamond_ore.drop_for(Some(item::item_rule(item::STONE_PICKAXE)), 0)
+        );
+        assert_eq!(
+            Some((item::DIAMOND, 1, 0)),
+            diamond_ore.drop_for(Some(item::item_rule(item::IRON_PICKAXE)), 0)
+        );
+
+        let redstone_ore = beta173::block_rule(item::REDSTONE_ORE as u8);
+        assert_eq!(
+            Some((item::REDSTONE, 4, 0)),
+            redstone_ore.drop_for(Some(item::item_rule(item::IRON_PICKAXE)), 0)
+        );
+
+        let clay = beta173::block_rule(item::CLAY_BLOCK as u8);
+        assert_eq!(Some((item::CLAY_BALL, 4, 0)), clay.drop_for(None, 0));
+
+        let obsidian = beta173::block_rule(item::OBSIDIAN as u8);
+        assert_eq!(
+            None,
+            obsidian.drop_for(Some(item::item_rule(item::IRON_PICKAXE)), 0)
+        );
+        assert_eq!(
+            Some((item::OBSIDIAN, 1, 0)),
+            obsidian.drop_for(Some(item::item_rule(item::DIAMOND_PICKAXE)), 0)
+        );
+
+        let stone = beta173::block_rule(item::STONE as u8);
+        assert!(stone.can_harvest(Some(item::item_rule(item::GOLDEN_PICKAXE))));
+        let iron_ore = beta173::block_rule(item::IRON_ORE as u8);
+        assert!(!iron_ore.can_harvest(Some(item::item_rule(item::GOLDEN_PICKAXE))));
+
+        let snow_layer = beta173::block_rule(item::SNOW_LAYER as u8);
+        assert_eq!(None, snow_layer.drop_for(None, 0));
+        assert_eq!(
+            Some((item::SNOWBALL, 1, 0)),
+            snow_layer.drop_for(Some(item::item_rule(item::WOODEN_SHOVEL)), 0)
+        );
+    }
+
+    #[test]
+    fn beta173_light_emitters_and_fluids_are_classified() {
+        use aurelia_common::beta173 as item;
+
+        assert_eq!(
+            15,
+            beta173::block_rule(item::GLOWSTONE as u8).light_emission
+        );
+        assert_eq!(15, beta173::block_rule(item::LAVA as u8).light_emission);
+        assert_eq!(14, beta173::block_rule(item::TORCH as u8).light_emission);
+        assert_eq!(
+            1,
+            beta173::block_rule(item::BROWN_MUSHROOM as u8).light_emission
+        );
+        assert_eq!(
+            7,
+            beta173::block_rule(item::REDSTONE_TORCH as u8).light_emission
+        );
+
+        let water = beta173::block_rule(item::WATER as u8);
+        assert_eq!(beta173::Material::Fluid, water.material);
+        assert!(!water.solid);
+        assert_eq!(None, water.drop_for(None, 0));
     }
 
     fn test_world_dir(name: &str) -> std::path::PathBuf {
