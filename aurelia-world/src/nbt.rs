@@ -118,9 +118,30 @@ impl Tag {
         }
     }
 
+    pub fn as_i8(&self) -> Option<i8> {
+        match self {
+            Self::Byte(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_i16(&self) -> Option<i16> {
+        match self {
+            Self::Short(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_int_array(&self) -> Option<&[i32]> {
+        match self {
+            Self::IntArray(values) => Some(values),
             _ => None,
         }
     }
@@ -353,6 +374,25 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
 
+    fn round_trip(document: Document) -> Document {
+        let mut encoded = Vec::new();
+        write_document(&document, &mut encoded).unwrap();
+        read_document(&mut encoded.as_slice()).unwrap()
+    }
+
+    fn simple_doc(root: Compound) -> Document {
+        Document {
+            root_name: String::new(),
+            root,
+        }
+    }
+
+    fn single(name: &str, tag: Tag) -> Compound {
+        let mut c = Compound::new();
+        c.insert(name.to_string(), tag);
+        c
+    }
+
     #[test]
     fn nbt_document_round_trips_required_beta_tags() {
         let mut nested = Compound::new();
@@ -380,10 +420,263 @@ mod tests {
             root,
         };
 
-        let mut encoded = Vec::new();
-        write_document(&document, &mut encoded).unwrap();
-        let decoded = read_document(&mut encoded.as_slice()).unwrap();
+        assert_eq!(document, round_trip(document.clone()));
+    }
 
-        assert_eq!(document, decoded);
+    #[test]
+    fn nbt_all_scalar_boundaries_round_trip() {
+        let mut root = Compound::new();
+        root.insert("i8_min".to_string(), Tag::Byte(i8::MIN));
+        root.insert("i8_max".to_string(), Tag::Byte(i8::MAX));
+        root.insert("i16_min".to_string(), Tag::Short(i16::MIN));
+        root.insert("i16_max".to_string(), Tag::Short(i16::MAX));
+        root.insert("i32_min".to_string(), Tag::Int(i32::MIN));
+        root.insert("i32_max".to_string(), Tag::Int(i32::MAX));
+        root.insert("i64_min".to_string(), Tag::Long(i64::MIN));
+        root.insert("i64_max".to_string(), Tag::Long(i64::MAX));
+        root.insert("f32_neg".to_string(), Tag::Float(-1.0_f32));
+        root.insert("f32_pos".to_string(), Tag::Float(f32::MAX));
+        root.insert("f64_neg".to_string(), Tag::Double(f64::NEG_INFINITY));
+        root.insert("f64_pos".to_string(), Tag::Double(f64::INFINITY));
+
+        let doc = simple_doc(root);
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_int_array_round_trips() {
+        let doc = simple_doc(single(
+            "arr",
+            Tag::IntArray(vec![i32::MIN, -1, 0, 1, i32::MAX]),
+        ));
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_empty_collections_round_trip() {
+        let mut root = Compound::new();
+        root.insert("empty_bytes".to_string(), Tag::ByteArray(vec![]));
+        root.insert("empty_ints".to_string(), Tag::IntArray(vec![]));
+        root.insert(
+            "empty_list".to_string(),
+            Tag::List {
+                element_type: TAG_INT,
+                elements: vec![],
+            },
+        );
+        root.insert("empty_compound".to_string(), Tag::Compound(Compound::new()));
+
+        let doc = simple_doc(root);
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_list_of_compounds_round_trips() {
+        let mut a = Compound::new();
+        a.insert("x".to_string(), Tag::Int(1));
+        let mut b = Compound::new();
+        b.insert("x".to_string(), Tag::Int(2));
+
+        let doc = simple_doc(single(
+            "entries",
+            Tag::List {
+                element_type: TAG_COMPOUND,
+                elements: vec![Tag::Compound(a), Tag::Compound(b)],
+            },
+        ));
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_deeply_nested_compound_round_trips() {
+        let inner = single("leaf", Tag::Long(42));
+        let mid = single("inner", Tag::Compound(inner));
+        let outer = single("mid", Tag::Compound(mid));
+
+        let doc = simple_doc(outer);
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_empty_string_tag_round_trips() {
+        let doc = simple_doc(single("s", Tag::String(String::new())));
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_empty_root_name_round_trips() {
+        let doc = Document {
+            root_name: String::new(),
+            root: Compound::new(),
+        };
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_non_empty_root_name_round_trips() {
+        let doc = Document {
+            root_name: "MinecraftLevel".to_string(),
+            root: Compound::new(),
+        };
+        assert_eq!(doc, round_trip(doc.clone()));
+    }
+
+    #[test]
+    fn nbt_rejects_non_compound_root() {
+        let bytes = [TAG_BYTE, 0x00, 0x00, 0x05];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_truncated_input() {
+        let bytes = [TAG_COMPOUND];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_unknown_tag_id() {
+        let bytes = [
+            TAG_COMPOUND,
+            0x00,
+            0x00, // root: TAG_COMPOUND, name=""
+            99,   // unknown tag id inside compound
+        ];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_negative_byte_array_length() {
+        let bytes = [
+            TAG_COMPOUND,
+            0x00,
+            0x00, // root
+            TAG_BYTE_ARRAY,
+            0x00,
+            0x01,
+            b'x', // "x": ByteArray
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF, // length = -1
+            TAG_END,
+        ];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_negative_int_array_length() {
+        let bytes = [
+            TAG_COMPOUND,
+            0x00,
+            0x00, // root
+            TAG_INT_ARRAY,
+            0x00,
+            0x01,
+            b'x', // "x": IntArray
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF, // length = -1
+            TAG_END,
+        ];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_negative_list_length() {
+        let bytes = [
+            TAG_COMPOUND,
+            0x00,
+            0x00, // root
+            TAG_LIST,
+            0x00,
+            0x01,
+            b'x',    // "x": List
+            TAG_INT, // element type
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF, // length = -1
+            TAG_END,
+        ];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_invalid_utf8_in_tag_name() {
+        let bytes = [
+            TAG_COMPOUND,
+            0x00,
+            0x00, // root
+            TAG_BYTE,
+            0x00,
+            0x02,
+            0xFF,
+            0xFE, // name: 2 bytes, invalid UTF-8
+            0x01, // byte payload
+            TAG_END,
+        ];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_invalid_utf8_in_string_value() {
+        let bytes = [
+            TAG_COMPOUND,
+            0x00,
+            0x00, // root
+            TAG_STRING,
+            0x00,
+            0x01,
+            b'x', // "x": String
+            0x00,
+            0x02,
+            0xFF,
+            0xFE, // string value: 2 bytes, invalid UTF-8
+            TAG_END,
+        ];
+        assert!(read_document(&mut bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn nbt_helper_accessors_return_correct_values_and_none_for_wrong_type() {
+        let byte_tag = Tag::Byte(-5);
+        let short_tag = Tag::Short(300);
+        let int_tag = Tag::Int(70000);
+        let long_tag = Tag::Long(5_000_000_000);
+        let arr_tag = Tag::IntArray(vec![10, 20]);
+
+        assert_eq!(Some(-5_i8), byte_tag.as_i8());
+        assert_eq!(None, int_tag.as_i8());
+
+        assert_eq!(Some(300_i16), short_tag.as_i16());
+        assert_eq!(None, byte_tag.as_i16());
+
+        assert_eq!(Some(70000_i32), int_tag.as_i32());
+        assert_eq!(None, byte_tag.as_i32());
+
+        assert_eq!(Some(5_000_000_000_i64), long_tag.as_i64());
+        assert_eq!(Some(70000_i64), int_tag.as_i64());
+        assert_eq!(None, byte_tag.as_i64());
+
+        assert_eq!(Some(&[10_i32, 20][..]), arr_tag.as_int_array());
+        assert_eq!(None, int_tag.as_int_array());
+
+        let str_tag = Tag::String("hello".to_string());
+        assert_eq!(Some("hello"), str_tag.as_str());
+        assert_eq!(None, byte_tag.as_str());
+    }
+
+    #[test]
+    fn nbt_list_type_mismatch_is_rejected_on_write() {
+        let doc = simple_doc(single(
+            "bad",
+            Tag::List {
+                element_type: TAG_INT,
+                elements: vec![Tag::Int(1), Tag::Byte(2)],
+            },
+        ));
+        let mut buf = Vec::new();
+        assert!(write_document(&doc, &mut buf).is_err());
     }
 }

@@ -38,9 +38,14 @@ World data and gameplay-adjacent rules:
 - Early Beta 1.7.3 block metadata, harvest rules, drops, and placement checks.
 - Dirty chunk tracking.
 - Entity ID and mob scaffolding.
-- Aurelia-native flat-world persistence.
-
-This crate does not currently implement vanilla McRegion/NBT persistence or vanilla terrain generation.
+- Aurelia-native flat-world persistence (`InMemoryWorldStorage`).
+- Vanilla Beta 1.7.3 McRegion/NBT persistence (`VanillaBeta173Storage`): reads
+  and writes `level.dat` (gzip NBT), `region/*.mcr` (McRegion chunk sectors with
+  zlib or gzip compression), and `players/*.dat` (gzip NBT). Unknown NBT tags are
+  preserved structurally. Tile entities and entities are NBT-preserved but not
+  functionally implemented. Lighting is placeholdered for new edited chunks and
+  not recalculated. Vanilla terrain generation for missing chunks is not
+  implemented — missing chunks are returned as empty air.
 
 ### `aurelia-region`
 
@@ -72,19 +77,38 @@ Runtime integration:
 2. `aurelia-protocol` decodes handshake and observed serverbound login packets.
 3. With `--experimental-join --playable-flat-world`, the server sends provisional login/spawn/position packets and flat-world chunk visibility/data.
 4. The joined loop decodes known movement, chat, inventory, digging, placement, and disconnect packets.
-5. World mutations go through `aurelia-world` APIs and are persisted in Aurelia-native files when dirty.
+5. World mutations go through `aurelia-world` APIs and are persisted either to Aurelia-native flat files or vanilla Beta 1.7.3 McRegion/NBT files depending on the configured storage mode.
 6. Chunk view changes send load/unload visibility updates as the player crosses chunk boundaries.
 
 Unknown or unverified protocol surfaces should fail conservatively instead of guessing through the stream.
 
 ## Persistence
 
-Current persistence is Aurelia-native:
+Two persistence backends exist, selected by `--world-format`:
 
+**Aurelia-native flat (`aurelia-flat`, default when no vanilla world is detected):**
 - Flat-world chunk edits are stored under `<world>/aurelia-flat-v1/`.
 - Player state is stored under `<world>/aurelia-players-v1/`.
+- These formats are not Anvil, McRegion, NBT, or vanilla-compatible.
 
-These formats are not Anvil, McRegion, NBT, or vanilla-compatible save formats. Vanilla save parity is planned for a later milestone.
+**Vanilla Beta 1.7.3 (`vanilla-beta173`, auto-selected when `level.dat` and
+`region/*.mcr` exist):**
+- `level.dat` is read/written as gzip-compressed NBT. Spawn and time are used;
+  other tags are preserved when rewritten.
+- Chunk data is read from and written to `region/*.mcr` McRegion files. Block IDs
+  and metadata round-trip correctly. Unmodified chunks in the same region file
+  are preserved byte-for-byte on save. Unknown NBT fields in chunks are
+  structurally preserved.
+- Player files are read from and written to `players/<username>.dat` (gzip NBT).
+  Position, rotation, health, and inventory slots are handled; unknown tags are
+  structurally preserved.
+
+**Known vanilla limitations (not yet implemented):**
+- No lighting recalculation — new or edited chunks receive placeholder lighting.
+- No vanilla terrain generation — missing vanilla chunks return empty air.
+- No Nether/DIM-1 support.
+- Tile entities and entities are NBT-preserved structurally but not functionally.
+- This is not full vanilla save parity.
 
 ## Clean-Room Boundaries
 

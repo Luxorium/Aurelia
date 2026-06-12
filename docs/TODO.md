@@ -47,7 +47,7 @@ This is still experimental and incomplete. Do not describe Aurelia as a complete
 - Item entities are not implemented; inventory-full drops are ignored rather than duplicated.
 - Health/death/respawn is server-side foundation only until client-visible packets are verified.
 - Damage sources beyond fall/void placeholders and combat are not implemented.
-- Persistence is Aurelia-native for modified flat-world chunks and basic player data. It is not vanilla McRegion/NBT.
+- Two persistence backends exist: Aurelia-native flat storage (default) and vanilla Beta 1.7.3 McRegion/NBT (`level.dat`, `region/*.mcr`, `players/*.dat`). Missing vanilla chunks return empty air; lighting is placeholdered; tile entity and entity behavior is not implemented.
 
 ## Testing Notes
 

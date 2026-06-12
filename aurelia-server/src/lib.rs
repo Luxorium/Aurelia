@@ -7124,6 +7124,364 @@ mod tests {
     }
 
     #[test]
+    fn vanilla_level_dat_unknown_tags_are_preserved_after_save() {
+        let dir = test_server_world_dir("vanilla-level-unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat_with_extra_tag(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+
+        let mut state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+        state.set_world_time(100);
+        state.save_dirty_chunks().unwrap();
+
+        let level = LevelDat::load(&dir.join("level.dat")).unwrap();
+        assert_eq!(100, level.time());
+        let data = level
+            .document()
+            .root
+            .get("Data")
+            .and_then(nbt::Tag::as_compound)
+            .unwrap();
+        assert_eq!(
+            Some("AureliaTestValue"),
+            data.get("AureliaExtraTag").and_then(nbt::Tag::as_str),
+            "unknown Data compound tags must survive a level.dat save cycle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_level_dat_level_name_and_seed_are_accessible() {
+        let dir = test_server_world_dir("vanilla-level-meta");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+
+        let level = LevelDat::load(&dir.join("level.dat")).unwrap();
+        assert_eq!(Some("AureliaTest"), level.level_name());
+        assert_eq!(Some(12345), level.random_seed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_level_dat_without_data_wrapper_falls_back_to_root() {
+        let dir = test_server_world_dir("vanilla-level-flat-root");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat_flat_root(&dir, BlockPos::new(8, 67, -12), 2400).unwrap();
+
+        let state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+        assert_eq!(BlockPos::new(8, 67, -12), state.spawn_position());
+        assert_eq!(2400, state.world_time());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_level_dat_missing_rejects_explicit_vanilla_format() {
+        let dir = test_server_world_dir("vanilla-level-absent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            GameServerState::new_vanilla_beta173(&dir).is_err(),
+            "vanilla-beta173 must fail when level.dat is absent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_player_unknown_root_tags_are_preserved_after_save() {
+        let dir = test_server_world_dir("vanilla-player-unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+        write_synthetic_vanilla_player_with_extra_tag(&dir, "AureliaUser").unwrap();
+
+        let state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+        let mut player = state
+            .load_player_state("AureliaUser", EntityId::new(1))
+            .unwrap()
+            .unwrap();
+        player.x = 5.0;
+        state.save_player_state(&player).unwrap();
+
+        let doc =
+            vanilla_beta173::read_gzip_nbt_file(&vanilla_player_file_path(&dir, "AureliaUser"))
+                .unwrap();
+        assert_eq!(
+            Some("preserved-value"),
+            doc.root.get("AureliaUnknownTag").and_then(nbt::Tag::as_str),
+            "unknown root tags must survive a player save cycle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_player_missing_file_returns_none() {
+        let dir = test_server_world_dir("vanilla-player-absent");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+        let state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+
+        let result = state
+            .load_player_state("NoSuchPlayer", EntityId::new(1))
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "non-existent player file must return None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_player_nether_dimension_loads_without_crashing() {
+        let dir = test_server_world_dir("vanilla-player-nether");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+        write_synthetic_vanilla_player_with_dimension(&dir, "NetherPlayer", -1).unwrap();
+
+        let state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+        let player = state
+            .load_player_state("NetherPlayer", EntityId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!("NetherPlayer", player.username);
+        assert_eq!(EntityId::new(1), player.entity_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_player_out_of_range_health_is_clamped() {
+        let dir = test_server_world_dir("vanilla-player-health");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+        write_synthetic_vanilla_player_with_health(&dir, "HighHealth", 30).unwrap();
+        write_synthetic_vanilla_player_with_health(&dir, "LowHealth", -5).unwrap();
+
+        let state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+        let high = state
+            .load_player_state("HighHealth", EntityId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(20, high.health, "health above 20 must be clamped to 20");
+
+        let low = state
+            .load_player_state("LowHealth", EntityId::new(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(0, low.health, "health below 0 must be clamped to 0");
+        assert_eq!(
+            PlayerLifeState::Dead,
+            low.life_state,
+            "zero health must set life_state to Dead"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_inventory_slot_mappings_are_symmetric() {
+        for i in 0i8..=8 {
+            let window = vanilla_inventory_slot_to_window_slot(i).unwrap();
+            assert_eq!(36 + i16::from(i), window);
+            assert_eq!(Some(i), window_slot_to_vanilla_inventory_slot(window));
+        }
+        for i in 9i8..=35 {
+            let window = vanilla_inventory_slot_to_window_slot(i).unwrap();
+            assert_eq!(i16::from(i), window);
+            assert_eq!(Some(i), window_slot_to_vanilla_inventory_slot(window));
+        }
+        for i in 0i8..=3 {
+            let vanilla = 100 + i;
+            let window = vanilla_inventory_slot_to_window_slot(vanilla).unwrap();
+            assert_eq!(5 + i16::from(i), window);
+            assert_eq!(Some(vanilla), window_slot_to_vanilla_inventory_slot(window));
+        }
+        assert!(vanilla_inventory_slot_to_window_slot(-1).is_none());
+        assert!(vanilla_inventory_slot_to_window_slot(36).is_none());
+        assert!(vanilla_inventory_slot_to_window_slot(99).is_none());
+        assert!(vanilla_inventory_slot_to_window_slot(104).is_none());
+    }
+
+    fn write_synthetic_level_dat_with_extra_tag(
+        dir: &Path,
+        spawn: BlockPos,
+        time: u64,
+    ) -> io::Result<()> {
+        let mut data = nbt::Compound::new();
+        data.insert(
+            "LevelName".to_string(),
+            nbt::Tag::String("AureliaTest".to_string()),
+        );
+        data.insert("RandomSeed".to_string(), nbt::Tag::Long(12345));
+        data.insert("SpawnX".to_string(), nbt::Tag::Int(spawn.x));
+        data.insert("SpawnY".to_string(), nbt::Tag::Int(spawn.y));
+        data.insert("SpawnZ".to_string(), nbt::Tag::Int(spawn.z));
+        data.insert("Time".to_string(), nbt::Tag::Long(time as i64));
+        data.insert("LastPlayed".to_string(), nbt::Tag::Long(1));
+        data.insert("version".to_string(), nbt::Tag::Int(19132));
+        data.insert(
+            "AureliaExtraTag".to_string(),
+            nbt::Tag::String("AureliaTestValue".to_string()),
+        );
+        let mut root = nbt::Compound::new();
+        root.insert("Data".to_string(), nbt::Tag::Compound(data));
+        let document = nbt::Document {
+            root_name: "Data".to_string(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&dir.join("level.dat"), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn write_synthetic_level_dat_flat_root(
+        dir: &Path,
+        spawn: BlockPos,
+        time: u64,
+    ) -> io::Result<()> {
+        let mut root = nbt::Compound::new();
+        root.insert("SpawnX".to_string(), nbt::Tag::Int(spawn.x));
+        root.insert("SpawnY".to_string(), nbt::Tag::Int(spawn.y));
+        root.insert("SpawnZ".to_string(), nbt::Tag::Int(spawn.z));
+        root.insert("Time".to_string(), nbt::Tag::Long(time as i64));
+        root.insert("LastPlayed".to_string(), nbt::Tag::Long(1));
+        root.insert("version".to_string(), nbt::Tag::Int(19132));
+        let document = nbt::Document {
+            root_name: "Data".to_string(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&dir.join("level.dat"), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn write_synthetic_vanilla_player_with_extra_tag(dir: &Path, username: &str) -> io::Result<()> {
+        let mut root = nbt::Compound::new();
+        root.insert(
+            "Pos".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_DOUBLE,
+                elements: vec![
+                    nbt::Tag::Double(10.0),
+                    nbt::Tag::Double(65.0),
+                    nbt::Tag::Double(10.0),
+                ],
+            },
+        );
+        root.insert(
+            "Rotation".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_FLOAT,
+                elements: vec![nbt::Tag::Float(0.0), nbt::Tag::Float(0.0)],
+            },
+        );
+        root.insert("Health".to_string(), nbt::Tag::Short(20));
+        root.insert("Dimension".to_string(), nbt::Tag::Int(0));
+        root.insert("SpawnX".to_string(), nbt::Tag::Int(0));
+        root.insert("SpawnY".to_string(), nbt::Tag::Int(65));
+        root.insert("SpawnZ".to_string(), nbt::Tag::Int(0));
+        root.insert(
+            "Inventory".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_COMPOUND,
+                elements: vec![],
+            },
+        );
+        root.insert(
+            "AureliaUnknownTag".to_string(),
+            nbt::Tag::String("preserved-value".to_string()),
+        );
+        let document = nbt::Document {
+            root_name: String::new(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&vanilla_player_file_path(dir, username), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn write_synthetic_vanilla_player_with_dimension(
+        dir: &Path,
+        username: &str,
+        dimension: i32,
+    ) -> io::Result<()> {
+        let mut root = nbt::Compound::new();
+        root.insert(
+            "Pos".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_DOUBLE,
+                elements: vec![
+                    nbt::Tag::Double(100.0),
+                    nbt::Tag::Double(64.0),
+                    nbt::Tag::Double(50.0),
+                ],
+            },
+        );
+        root.insert(
+            "Rotation".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_FLOAT,
+                elements: vec![nbt::Tag::Float(0.0), nbt::Tag::Float(0.0)],
+            },
+        );
+        root.insert("Health".to_string(), nbt::Tag::Short(20));
+        root.insert("Dimension".to_string(), nbt::Tag::Int(dimension));
+        root.insert("SpawnX".to_string(), nbt::Tag::Int(0));
+        root.insert("SpawnY".to_string(), nbt::Tag::Int(65));
+        root.insert("SpawnZ".to_string(), nbt::Tag::Int(0));
+        root.insert(
+            "Inventory".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_COMPOUND,
+                elements: vec![],
+            },
+        );
+        let document = nbt::Document {
+            root_name: String::new(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&vanilla_player_file_path(dir, username), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn write_synthetic_vanilla_player_with_health(
+        dir: &Path,
+        username: &str,
+        health: i16,
+    ) -> io::Result<()> {
+        let mut root = nbt::Compound::new();
+        root.insert(
+            "Pos".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_DOUBLE,
+                elements: vec![
+                    nbt::Tag::Double(0.0),
+                    nbt::Tag::Double(65.0),
+                    nbt::Tag::Double(0.0),
+                ],
+            },
+        );
+        root.insert(
+            "Rotation".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_FLOAT,
+                elements: vec![nbt::Tag::Float(0.0), nbt::Tag::Float(0.0)],
+            },
+        );
+        root.insert("Health".to_string(), nbt::Tag::Short(health));
+        root.insert("Dimension".to_string(), nbt::Tag::Int(0));
+        root.insert("SpawnX".to_string(), nbt::Tag::Int(0));
+        root.insert("SpawnY".to_string(), nbt::Tag::Int(65));
+        root.insert("SpawnZ".to_string(), nbt::Tag::Int(0));
+        root.insert(
+            "Inventory".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_COMPOUND,
+                elements: vec![],
+            },
+        );
+        let document = nbt::Document {
+            root_name: String::new(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&vanilla_player_file_path(dir, username), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    #[test]
     fn chat_commands_and_echo_respond_without_disconnect() {
         let mut session = PlayerSession::new(playable_config(0));
         let mut input = encoded_handshake("Luxorium");

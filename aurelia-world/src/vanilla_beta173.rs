@@ -599,9 +599,9 @@ fn read_region_timestamps(path: &Path) -> io::Result<Vec<u32>> {
         ));
     }
     let mut timestamps = vec![0; REGION_ENTRY_COUNT];
-    for index in 0..REGION_ENTRY_COUNT {
+    for (index, ts) in timestamps.iter_mut().enumerate() {
         let offset = SECTOR_BYTES + (index * 4);
-        timestamps[index] = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        *ts = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
     }
     Ok(timestamps)
 }
@@ -690,7 +690,7 @@ fn write_region_sectors_atomic(
 
         output.extend_from_slice(raw);
         let padding = (sector_count * SECTOR_BYTES) - raw.len();
-        output.extend(std::iter::repeat(0).take(padding));
+        output.resize(output.len() + padding, 0u8);
         next_sector += sector_count as u32;
     }
 
@@ -847,6 +847,340 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn mcregion_multiple_chunks_same_region_both_load_correctly() {
+        let dir = test_world_dir("mcr-multi-load");
+        let _ = fs::remove_dir_all(&dir);
+
+        let pos_a = ChunkPos::new(0, 0);
+        let pos_b = ChunkPos::new(1, 0);
+        write_two_chunks_same_region(&dir, pos_a, pos_b).unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        let a = storage.load_chunk(pos_a).unwrap();
+        let b = storage.load_chunk(pos_b).unwrap();
+
+        assert_eq!(BlockState::STONE, a.block_at(0, 0, 0));
+        assert_eq!(BlockState::DIRT, a.block_at(1, 1, 0));
+        assert_eq!(BlockState::GRASS, b.block_at(0, 0, 0));
+        assert_eq!(BlockState::STONE, b.block_at(2, 2, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_dirty_save_of_one_chunk_preserves_other_in_same_region() {
+        let dir = test_world_dir("mcr-multi-save");
+        let _ = fs::remove_dir_all(&dir);
+
+        let pos_a = ChunkPos::new(0, 0);
+        let pos_b = ChunkPos::new(1, 0);
+        write_two_chunks_same_region(&dir, pos_a, pos_b).unwrap();
+
+        let mut world = World::new(VanillaBeta173Storage::new(&dir), crate::FlatWorldGenerator);
+        world.set_block(
+            aurelia_common::BlockPos::new(0, 0, 0),
+            BlockState::new_unchecked(5, 0),
+        );
+        assert_eq!(1, world.dirty_chunk_count());
+        world.storage_mut().save_dirty_chunks().unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        let a = storage.load_chunk(pos_a).unwrap();
+        let b = storage.load_chunk(pos_b).unwrap();
+
+        assert_eq!(BlockState::new_unchecked(5, 0), a.block_at(0, 0, 0));
+        assert_eq!(BlockState::GRASS, b.block_at(0, 0, 0));
+        assert_eq!(BlockState::STONE, b.block_at(2, 2, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_negative_chunk_coordinates_save_and_load() {
+        let dir = test_world_dir("mcr-negative");
+        let _ = fs::remove_dir_all(&dir);
+
+        let pos = ChunkPos::new(-5, -3);
+        write_single_marker_chunk(&dir, pos).unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        let chunk = storage.load_chunk(pos).unwrap();
+        assert_eq!(BlockState::STONE, chunk.block_at(0, 0, 0));
+
+        let mut world = World::new(VanillaBeta173Storage::new(&dir), crate::FlatWorldGenerator);
+        world.set_block(
+            aurelia_common::BlockPos::new(pos.x * 16, 10, pos.z * 16),
+            BlockState::DIRT,
+        );
+        world.storage_mut().save_dirty_chunks().unwrap();
+
+        let reloaded = VanillaBeta173Storage::new(&dir);
+        let chunk2 = reloaded.load_chunk(pos).unwrap();
+        assert_eq!(BlockState::DIRT, chunk2.block_at(0, 10, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_gzip_compressed_chunk_loads_correctly() {
+        let dir = test_world_dir("mcr-gzip");
+        let _ = fs::remove_dir_all(&dir);
+
+        let pos = ChunkPos::new(0, 0);
+        write_gzip_chunk(&dir, pos).unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        let chunk = storage.load_chunk(pos).unwrap();
+        assert_eq!(BlockState::STONE, chunk.block_at(0, 0, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_missing_chunk_in_existing_region_returns_none() {
+        let dir = test_world_dir("mcr-missing");
+        let _ = fs::remove_dir_all(&dir);
+
+        write_single_marker_chunk(&dir, ChunkPos::new(0, 0)).unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        assert!(storage.load_chunk(ChunkPos::new(1, 0)).is_none());
+        assert!(storage.load_chunk(ChunkPos::new(0, 1)).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_nonexistent_region_file_returns_none() {
+        let dir = test_world_dir("mcr-no-region");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        assert!(storage.load_chunk(ChunkPos::new(0, 0)).is_none());
+        assert!(storage.load_chunk(ChunkPos::new(100, 200)).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_malformed_header_too_small_returns_error() {
+        let dir = test_world_dir("mcr-bad-header");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("region")).unwrap();
+
+        let path = region_file_path(&dir, ChunkPos::new(0, 0));
+        fs::write(&path, b"too short").unwrap();
+
+        let result = read_region_sectors(&path);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_invalid_offset_pointing_outside_file_returns_error() {
+        let dir = test_world_dir("mcr-bad-offset");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("region")).unwrap();
+
+        let mut header = vec![0u8; HEADER_BYTES];
+        // Chunk at index 0: offset=200 sectors, sector_count=1 (well beyond file end)
+        header[0] = 0x00;
+        header[1] = 0x00;
+        header[2] = 200;
+        header[3] = 1;
+
+        let path = region_file_path(&dir, ChunkPos::new(0, 0));
+        fs::write(&path, &header).unwrap();
+
+        let result = read_region_sectors(&path);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_region_rejects_oversized_chunk_sector_count() {
+        let dir = test_world_dir("mcr-oversized");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("region")).unwrap();
+
+        let mut sectors = vec![None; REGION_ENTRY_COUNT];
+        sectors[0] = Some(vec![0u8; 256 * SECTOR_BYTES]);
+        let timestamps = vec![0u32; REGION_ENTRY_COUNT];
+        let path = region_file_path(&dir, ChunkPos::new(0, 0));
+
+        let result = write_region_sectors_atomic(&path, &sectors, &timestamps);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_zlib_chunk_encode_decode_round_trips() {
+        let pos = ChunkPos::new(3, -7);
+        let mut chunk = Chunk::new(pos);
+        chunk.set_block(5, 50, 5, BlockState::new_unchecked(14, 3));
+
+        let mut document = new_chunk_document(pos);
+        update_chunk_document(&mut document, &chunk).unwrap();
+        let sector = encode_chunk_sector(&document).unwrap();
+
+        let decoded_doc = decode_chunk_sector(&sector).unwrap();
+        let decoded_chunk = chunk_from_document(pos, &decoded_doc).unwrap();
+
+        assert_eq!(
+            BlockState::new_unchecked(14, 3),
+            decoded_chunk.block_at(5, 50, 5)
+        );
+        assert_eq!(BlockState::AIR, decoded_chunk.block_at(0, 0, 0));
+    }
+
+    #[test]
+    fn mcregion_entities_and_tile_entities_preserved_through_chunk_save() {
+        let dir = test_world_dir("mcr-entities");
+        let _ = fs::remove_dir_all(&dir);
+
+        let pos = ChunkPos::new(0, 0);
+        let mut chunk = Chunk::new(pos);
+        chunk.set_block(0, 0, 0, BlockState::STONE);
+        let mut document = new_chunk_document(pos);
+        update_chunk_document(&mut document, &chunk).unwrap();
+
+        let mut entity = Compound::new();
+        entity.insert("id".to_string(), Tag::String("Zombie".to_string()));
+        entity.insert("Health".to_string(), Tag::Short(20));
+        let level = chunk_level_mut(&mut document).unwrap();
+        level.insert(
+            "Entities".to_string(),
+            Tag::List {
+                element_type: nbt::TAG_COMPOUND,
+                elements: vec![Tag::Compound(entity)],
+            },
+        );
+        let mut tile_entity = Compound::new();
+        tile_entity.insert("id".to_string(), Tag::String("Chest".to_string()));
+        tile_entity.insert("x".to_string(), Tag::Int(3));
+        tile_entity.insert("y".to_string(), Tag::Int(64));
+        tile_entity.insert("z".to_string(), Tag::Int(3));
+        level.insert(
+            "TileEntities".to_string(),
+            Tag::List {
+                element_type: nbt::TAG_COMPOUND,
+                elements: vec![Tag::Compound(tile_entity)],
+            },
+        );
+
+        let sector = encode_chunk_sector(&document).unwrap();
+        let mut sectors = vec![None; REGION_ENTRY_COUNT];
+        sectors[local_chunk_index(pos)] = Some(sector);
+        write_region_sectors_atomic(
+            &region_file_path(&dir, pos),
+            &sectors,
+            &vec![0u32; REGION_ENTRY_COUNT],
+        )
+        .unwrap();
+
+        let mut world = World::new(VanillaBeta173Storage::new(&dir), crate::FlatWorldGenerator);
+        world.set_block(aurelia_common::BlockPos::new(1, 1, 1), BlockState::DIRT);
+        assert_eq!(1, world.storage_mut().save_dirty_chunks().unwrap());
+
+        let sector = read_chunk_sector(&region_file_path(&dir, pos), pos)
+            .unwrap()
+            .unwrap();
+        let doc = decode_chunk_sector(&sector).unwrap();
+        let level = chunk_level(&doc).unwrap();
+
+        let (_, entity_list) = level.get("Entities").and_then(Tag::as_list).unwrap();
+        assert_eq!(1, entity_list.len(), "Entities count must be preserved");
+        let entity_compound = entity_list[0].as_compound().unwrap();
+        assert_eq!(
+            Some("Zombie"),
+            entity_compound.get("id").and_then(Tag::as_str)
+        );
+
+        let (_, te_list) = level.get("TileEntities").and_then(Tag::as_list).unwrap();
+        assert_eq!(1, te_list.len(), "TileEntities count must be preserved");
+        let te_compound = te_list[0].as_compound().unwrap();
+        assert_eq!(Some("Chest"), te_compound.get("id").and_then(Tag::as_str));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_missing_vanilla_chunk_returns_empty_air_without_generating() {
+        let dir = test_world_dir("mcr-air");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = VanillaBeta173Storage::new(&dir);
+        assert!(
+            storage.load_chunk(ChunkPos::new(5, 7)).is_none(),
+            "missing vanilla chunk should return None from storage"
+        );
+
+        let mut world = World::new(VanillaBeta173Storage::new(&dir), crate::FlatWorldGenerator);
+        let chunk = world.get_or_create_chunk(ChunkPos::new(5, 7));
+        assert_eq!(BlockState::AIR, chunk.block_at(0, 0, 0));
+        assert_eq!(BlockState::AIR, chunk.block_at(8, 63, 8));
+        assert_eq!(BlockState::AIR, chunk.block_at(15, 127, 15));
+        assert!(
+            !world.is_chunk_loaded(ChunkPos::new(5, 7)),
+            "missing vanilla chunk placeholder must not be cached or persisted"
+        );
+        assert_eq!(0, world.dirty_chunk_count());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcregion_original_lighting_arrays_preserved_when_blocks_changed() {
+        let dir = test_world_dir("mcr-lighting");
+        let _ = fs::remove_dir_all(&dir);
+
+        let pos = ChunkPos::new(0, 0);
+        let mut chunk = Chunk::new(pos);
+        chunk.set_block(0, 0, 0, BlockState::STONE);
+        let mut document = new_chunk_document(pos);
+        update_chunk_document(&mut document, &chunk).unwrap();
+        let level = chunk_level_mut(&mut document).unwrap();
+        let custom_block_light = vec![0xABu8; NIBBLE_ARRAY_BYTES];
+        let custom_sky_light = vec![0x55u8; NIBBLE_ARRAY_BYTES];
+        level.insert(
+            "BlockLight".to_string(),
+            Tag::ByteArray(custom_block_light.clone()),
+        );
+        level.insert(
+            "SkyLight".to_string(),
+            Tag::ByteArray(custom_sky_light.clone()),
+        );
+
+        let sector = encode_chunk_sector(&document).unwrap();
+        let mut sectors = vec![None; REGION_ENTRY_COUNT];
+        sectors[local_chunk_index(pos)] = Some(sector);
+        write_region_sectors_atomic(
+            &region_file_path(&dir, pos),
+            &sectors,
+            &vec![0u32; REGION_ENTRY_COUNT],
+        )
+        .unwrap();
+
+        let mut world = World::new(VanillaBeta173Storage::new(&dir), crate::FlatWorldGenerator);
+        world.set_block(aurelia_common::BlockPos::new(0, 10, 0), BlockState::DIRT);
+        assert_eq!(1, world.storage_mut().save_dirty_chunks().unwrap());
+
+        let sector = read_chunk_sector(&region_file_path(&dir, pos), pos)
+            .unwrap()
+            .unwrap();
+        let doc = decode_chunk_sector(&sector).unwrap();
+        let level = chunk_level(&doc).unwrap();
+        assert_eq!(
+            Some(custom_block_light.as_slice()),
+            level.get("BlockLight").and_then(Tag::as_byte_array),
+            "BlockLight must be preserved from original chunk after block mutation"
+        );
+        assert_eq!(
+            Some(custom_sky_light.as_slice()),
+            level.get("SkyLight").and_then(Tag::as_byte_array),
+            "SkyLight must be preserved from original chunk after block mutation"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn write_synthetic_region_chunk(dir: &Path, pos: ChunkPos) -> Result<()> {
         let mut chunk = Chunk::new(pos);
         chunk.set_block(0, 0, 0, BlockState::STONE);
@@ -865,6 +1199,80 @@ mod tests {
         sectors[local_chunk_index(pos)] = Some(sector);
         let mut timestamps = vec![0; REGION_ENTRY_COUNT];
         timestamps[local_chunk_index(pos)] = 1;
+        write_region_sectors_atomic(&region_file_path(dir, pos), &sectors, &timestamps)?;
+        Ok(())
+    }
+
+    fn write_single_marker_chunk(dir: &Path, pos: ChunkPos) -> Result<()> {
+        let mut chunk = Chunk::new(pos);
+        chunk.set_block(0, 0, 0, BlockState::STONE);
+
+        let mut document = new_chunk_document(pos);
+        update_chunk_document(&mut document, &chunk)?;
+        let sector = encode_chunk_sector(&document)?;
+        let mut sectors = vec![None; REGION_ENTRY_COUNT];
+        sectors[local_chunk_index(pos)] = Some(sector);
+        let mut timestamps = vec![0u32; REGION_ENTRY_COUNT];
+        timestamps[local_chunk_index(pos)] = 1;
+        write_region_sectors_atomic(&region_file_path(dir, pos), &sectors, &timestamps)?;
+        Ok(())
+    }
+
+    fn write_two_chunks_same_region(dir: &Path, pos_a: ChunkPos, pos_b: ChunkPos) -> Result<()> {
+        let (ra, _) = region_pos_for_chunk(pos_a);
+        let (rb, _) = region_pos_for_chunk(pos_b);
+        assert_eq!(
+            ra, rb,
+            "both chunks must be in the same region for this helper"
+        );
+
+        let mut chunk_a = Chunk::new(pos_a);
+        chunk_a.set_block(0, 0, 0, BlockState::STONE);
+        chunk_a.set_block(1, 1, 0, BlockState::DIRT);
+
+        let mut chunk_b = Chunk::new(pos_b);
+        chunk_b.set_block(0, 0, 0, BlockState::GRASS);
+        chunk_b.set_block(2, 2, 0, BlockState::STONE);
+
+        let mut sectors = vec![None; REGION_ENTRY_COUNT];
+        let mut timestamps = vec![0u32; REGION_ENTRY_COUNT];
+
+        for (pos, chunk) in &[(pos_a, chunk_a), (pos_b, chunk_b)] {
+            let mut document = new_chunk_document(*pos);
+            update_chunk_document(&mut document, chunk)?;
+            let sector = encode_chunk_sector(&document)?;
+            let idx = local_chunk_index(*pos);
+            sectors[idx] = Some(sector);
+            timestamps[idx] = 1;
+        }
+
+        write_region_sectors_atomic(&region_file_path(dir, pos_a), &sectors, &timestamps)?;
+        Ok(())
+    }
+
+    fn write_gzip_chunk(dir: &Path, pos: ChunkPos) -> Result<()> {
+        let mut chunk = Chunk::new(pos);
+        chunk.set_block(0, 0, 0, BlockState::STONE);
+
+        let mut document = new_chunk_document(pos);
+        update_chunk_document(&mut document, &chunk)?;
+
+        let mut nbt_bytes = Vec::new();
+        nbt::write_document(&document, &mut nbt_bytes)?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&nbt_bytes)?;
+        let compressed = encoder.finish()?;
+
+        let length = u32::try_from(compressed.len() + 1)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "gzip payload too large"))?;
+        let mut sector = Vec::with_capacity(5 + compressed.len());
+        sector.extend_from_slice(&length.to_be_bytes());
+        sector.push(COMPRESSION_GZIP);
+        sector.extend_from_slice(&compressed);
+
+        let mut sectors = vec![None; REGION_ENTRY_COUNT];
+        sectors[local_chunk_index(pos)] = Some(sector);
+        let timestamps = vec![0u32; REGION_ENTRY_COUNT];
         write_region_sectors_atomic(&region_file_path(dir, pos), &sectors, &timestamps)?;
         Ok(())
     }
