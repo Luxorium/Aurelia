@@ -4,6 +4,9 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+pub mod nbt;
+pub mod vanilla_beta173;
+
 pub const WORLD_HEIGHT: usize = 128;
 pub const SEA_LEVEL: usize = 64;
 pub const FLAT_GRASS_Y: usize = 63;
@@ -1340,6 +1343,10 @@ pub trait WorldStorage {
     fn contains_chunk(&self, pos: ChunkPos) -> bool;
     fn mark_dirty(&mut self, pos: ChunkPos);
     fn dirty_chunk_count(&self) -> usize;
+
+    fn should_generate_missing_chunks(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1497,9 +1504,17 @@ impl<S: WorldStorage> World<S> {
             return chunk;
         }
 
+        if !self.storage.should_generate_missing_chunks() {
+            return Chunk::new(pos);
+        }
+
         let generated = self.generator.generate(pos);
         self.storage.save_chunk(generated.clone());
         generated
+    }
+
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
     }
 
     pub fn ensure_chunk_loaded(&mut self, pos: ChunkPos) {
@@ -1593,6 +1608,15 @@ impl<S: WorldStorage> World<S> {
 impl World<InMemoryWorldStorage> {
     pub fn save_dirty_chunks(&mut self, path: &Path) -> io::Result<usize> {
         self.storage.save_dirty_to_dir(path)
+    }
+}
+
+impl World<vanilla_beta173::ActiveWorldStorage> {
+    pub fn save_active_dirty_chunks(
+        &mut self,
+        aurelia_flat_dir: Option<&Path>,
+    ) -> io::Result<usize> {
+        self.storage.save_dirty_chunks(aurelia_flat_dir)
     }
 }
 

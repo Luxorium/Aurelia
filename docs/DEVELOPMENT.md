@@ -51,6 +51,12 @@ cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join
 
 Then connect with a clean Beta 1.7.3 client to `127.0.0.1:25565`.
 
+Run against a vanilla Beta 1.7.3-style world folder:
+
+```bash
+cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --world ./world --world-format=vanilla-beta173 --chunk-radius 1 --compat-debug
+```
+
 This path is for compatibility research and MVP gameplay testing. It is not a full compatibility claim.
 
 ## Tracing Flags
@@ -64,7 +70,11 @@ Useful flags:
 - `--compat-debug` enables packet tracing and raises the trace window for compatibility debugging.
 - `--login-response-mode beta173-observed` uses the currently recommended provisional login response mode.
 - `--login-response-mode mcdevs-legacy` keeps the alternate debug response mode available for comparison.
-- `--chunk-radius <n>` controls the flat-world chunk radius sent around the player.
+- `--world <path>` selects the world folder.
+- `--world-format auto|aurelia-flat|vanilla-beta173` selects save storage.
+  Auto prefers `level.dat` plus `region/*.mcr`, then Aurelia flat storage.
+- `--chunk-radius <n>` controls the chunk radius sent around the player in
+  playable flat and vanilla world modes.
 - `--post-join-minimal` suppresses optional post-join clientbound packets for stream-alignment testing.
 - `--no-inventory-sync`, `--no-time-update`, `--time-update-mode off|once|interval`, `--no-keepalive`, and `--keepalive-mode off|serverbound-no-payload|serverbound-int32` isolate specific compatibility surfaces.
 

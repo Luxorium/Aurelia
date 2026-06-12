@@ -21,8 +21,10 @@ use aurelia_protocol::{
 };
 use aurelia_region::RegionScheduler;
 use aurelia_world::{
-    beta173 as block_rules, BlockState, Chunk, EntityId, EntityKind, EntityManager,
-    FlatWorldGenerator, InMemoryWorldStorage, World,
+    beta173 as block_rules, nbt,
+    vanilla_beta173::{self, ActiveWorldStorage, LevelDat, VanillaBeta173Storage},
+    BlockState, Chunk, EntityId, EntityKind, EntityManager, FlatWorldGenerator,
+    InMemoryWorldStorage, World,
 };
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -207,6 +209,35 @@ pub struct ServerConfig {
     pub keepalive_mode: KeepAliveMode,
     pub defer_inventory_sync: bool,
     pub post_join_minimal: bool,
+    pub world_storage_mode: WorldStorageMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldStorageMode {
+    Auto,
+    AureliaFlat,
+    VanillaBeta173,
+}
+
+impl WorldStorageMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "aurelia-flat" => Ok(Self::AureliaFlat),
+            "vanilla-beta173" => Ok(Self::VanillaBeta173),
+            _ => Err(ServerError::InvalidConfig(format!(
+                "invalid world format: {value}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::AureliaFlat => "aurelia-flat",
+            Self::VanillaBeta173 => "vanilla-beta173",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +398,7 @@ impl ServerConfig {
             },
             defer_inventory_sync,
             post_join_minimal,
+            world_storage_mode: WorldStorageMode::Auto,
         };
         config.validate()?;
         Ok(config)
@@ -392,6 +424,7 @@ impl ServerConfig {
             keepalive_mode: KeepAliveMode::ServerboundNoPayload,
             defer_inventory_sync: true,
             post_join_minimal: false,
+            world_storage_mode: WorldStorageMode::Auto,
         }
     }
 
@@ -448,6 +481,7 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     let mut keepalive_mode = defaults.keepalive_mode;
     let mut defer_inventory_sync = defaults.defer_inventory_sync;
     let mut post_join_minimal = defaults.post_join_minimal;
+    let mut world_storage_mode = defaults.world_storage_mode;
 
     let mut index = 0;
     while index < args.len() {
@@ -533,6 +567,12 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
             defer_inventory_sync = true;
         } else if arg == "--post-join-minimal" {
             post_join_minimal = true;
+        } else if let Some(value) = arg.strip_prefix("--world-format=") {
+            world_storage_mode = WorldStorageMode::parse(value)?;
+        } else if arg == "--world-format" {
+            index += 1;
+            world_storage_mode =
+                WorldStorageMode::parse(required_arg_value(args, index, "--world-format")?)?;
         }
         index += 1;
     }
@@ -557,6 +597,7 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     )?;
     config.time_update_mode = time_update_mode;
     config.keepalive_mode = keepalive_mode;
+    config.world_storage_mode = world_storage_mode;
     config.validate()?;
     Ok(config)
 }
@@ -600,6 +641,67 @@ fn world_save_dir(config: &ServerConfig) -> PathBuf {
     Path::new(&config.world_name).join("aurelia-flat-v1")
 }
 
+fn world_root_dir(config: &ServerConfig) -> PathBuf {
+    PathBuf::from(&config.world_name)
+}
+
+pub fn resolve_world_storage_mode(config: &ServerConfig) -> Result<WorldStorageMode> {
+    let world_dir = world_root_dir(config);
+    match config.world_storage_mode {
+        WorldStorageMode::VanillaBeta173 => {
+            let level_dat = world_dir.join("level.dat");
+            if !level_dat.exists() {
+                return Err(ServerError::InvalidConfig(format!(
+                    "--world-format=vanilla-beta173 requires {}",
+                    level_dat.display()
+                )));
+            }
+            Ok(WorldStorageMode::VanillaBeta173)
+        }
+        WorldStorageMode::AureliaFlat => Ok(WorldStorageMode::AureliaFlat),
+        WorldStorageMode::Auto => {
+            if has_vanilla_beta173_world(&world_dir) {
+                return Ok(WorldStorageMode::VanillaBeta173);
+            }
+            if has_aurelia_flat_world(&world_dir) {
+                return Ok(WorldStorageMode::AureliaFlat);
+            }
+            Ok(WorldStorageMode::AureliaFlat)
+        }
+    }
+}
+
+fn has_vanilla_beta173_world(world_dir: &Path) -> bool {
+    world_dir.join("level.dat").exists() && has_mcregion_files(&world_dir.join("region"))
+}
+
+fn has_mcregion_files(region_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(region_dir) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("mcr")
+    })
+}
+
+fn has_aurelia_flat_world(world_dir: &Path) -> bool {
+    let flat_dir = world_dir.join("aurelia-flat-v1");
+    let Ok(entries) = fs::read_dir(flat_dir) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("achunk")
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Handshaking,
@@ -632,10 +734,13 @@ pub type SharedGameServerState = Arc<Mutex<GameServerState>>;
 
 #[derive(Debug)]
 pub struct GameServerState {
-    world: World<InMemoryWorldStorage>,
+    world: World<ActiveWorldStorage>,
     entities: EntityManager,
     players: HashMap<String, EntityId>,
     world_save_dir: Option<PathBuf>,
+    world_root_dir: Option<PathBuf>,
+    level_dat: Option<LevelDat>,
+    world_storage_mode: WorldStorageMode,
 }
 
 impl Default for GameServerState {
@@ -647,10 +752,16 @@ impl Default for GameServerState {
 impl GameServerState {
     pub fn new_flat() -> Self {
         Self {
-            world: World::new(InMemoryWorldStorage::default(), FlatWorldGenerator),
+            world: World::new(
+                ActiveWorldStorage::AureliaFlat(InMemoryWorldStorage::default()),
+                FlatWorldGenerator,
+            ),
             entities: EntityManager::default(),
             players: HashMap::new(),
             world_save_dir: None,
+            world_root_dir: None,
+            level_dat: None,
+            world_storage_mode: WorldStorageMode::AureliaFlat,
         }
     }
 
@@ -662,15 +773,50 @@ impl GameServerState {
         let path = path.into();
         let storage = InMemoryWorldStorage::load_from_dir(&path)?;
         Ok(Self {
-            world: World::new(storage, FlatWorldGenerator),
+            world: World::new(ActiveWorldStorage::AureliaFlat(storage), FlatWorldGenerator),
             entities: EntityManager::default(),
             players: HashMap::new(),
             world_save_dir: Some(path),
+            world_root_dir: None,
+            level_dat: None,
+            world_storage_mode: WorldStorageMode::AureliaFlat,
         })
     }
 
     pub fn shared_flat_persistent(path: impl Into<PathBuf>) -> Result<SharedGameServerState> {
         Ok(Arc::new(Mutex::new(Self::new_flat_persistent(path)?)))
+    }
+
+    pub fn new_vanilla_beta173(world_dir: impl Into<PathBuf>) -> Result<Self> {
+        let world_dir = world_dir.into();
+        let level_path = world_dir.join("level.dat");
+        if !level_path.exists() {
+            return Err(ServerError::InvalidConfig(format!(
+                "vanilla-beta173 world format requires {}",
+                level_path.display()
+            )));
+        }
+        let level_dat = LevelDat::load(&level_path).map_err(|error| {
+            ServerError::InvalidConfig(format!("failed to read level.dat: {error}"))
+        })?;
+        let mut world = World::new(
+            ActiveWorldStorage::VanillaBeta173(VanillaBeta173Storage::new(&world_dir)),
+            FlatWorldGenerator,
+        );
+        world.set_time(level_dat.time());
+        Ok(Self {
+            world,
+            entities: EntityManager::default(),
+            players: HashMap::new(),
+            world_save_dir: None,
+            world_root_dir: Some(world_dir),
+            level_dat: Some(level_dat),
+            world_storage_mode: WorldStorageMode::VanillaBeta173,
+        })
+    }
+
+    pub fn shared_vanilla_beta173(world_dir: impl Into<PathBuf>) -> Result<SharedGameServerState> {
+        Ok(Arc::new(Mutex::new(Self::new_vanilla_beta173(world_dir)?)))
     }
 
     pub fn tick(&mut self) {
@@ -683,6 +829,32 @@ impl GameServerState {
 
     pub fn set_world_time(&mut self, time: u64) {
         self.world.set_time(time);
+    }
+
+    pub fn world_storage_mode(&self) -> WorldStorageMode {
+        self.world_storage_mode
+    }
+
+    pub fn spawn_position(&self) -> BlockPos {
+        if let Some(level_dat) = self.level_dat.as_ref() {
+            if let Ok((x, y, z)) = level_dat.spawn() {
+                return BlockPos::new(x, y, z);
+            }
+        }
+        aurelia_world::SPAWN_POSITION
+    }
+
+    pub fn new_player_state(
+        &self,
+        username: impl Into<String>,
+        entity_id: EntityId,
+    ) -> PlayerState {
+        let username = username.into();
+        if self.world_storage_mode == WorldStorageMode::VanillaBeta173 {
+            PlayerState::new_at_spawn(username, entity_id, self.spawn_position())
+        } else {
+            PlayerState::new(username, entity_id)
+        }
     }
 
     pub fn block_at(&mut self, pos: BlockPos) -> BlockState {
@@ -706,7 +878,7 @@ impl GameServerState {
     }
 
     pub fn is_valid_block_pos(pos: BlockPos) -> bool {
-        World::<InMemoryWorldStorage>::is_valid_block_pos(pos)
+        World::<ActiveWorldStorage>::is_valid_block_pos(pos)
     }
 
     pub fn break_block(&mut self, pos: BlockPos) -> bool {
@@ -726,17 +898,31 @@ impl GameServerState {
     }
 
     pub fn save_dirty_chunks(&mut self) -> Result<usize> {
-        let Some(path) = self.world_save_dir.as_ref() else {
-            return Ok(0);
-        };
-        Ok(self.world.save_dirty_chunks(path)?)
+        let saved = self
+            .world
+            .save_active_dirty_chunks(self.world_save_dir.as_deref())?;
+        self.save_level_dat()?;
+        Ok(saved)
     }
 
     pub fn save_player_state(&self, player: &PlayerState) -> Result<()> {
-        let Some(chunk_path) = self.world_save_dir.as_ref() else {
-            return Ok(());
-        };
-        write_player_file(&player_save_dir(chunk_path), player)?;
+        match self.world_storage_mode {
+            WorldStorageMode::VanillaBeta173 => {
+                let Some(world_dir) = self.world_root_dir.as_ref() else {
+                    return Ok(());
+                };
+                write_vanilla_player_file(
+                    &vanilla_player_file_path(world_dir, &player.username),
+                    player,
+                )?;
+            }
+            _ => {
+                let Some(chunk_path) = self.world_save_dir.as_ref() else {
+                    return Ok(());
+                };
+                write_player_file(&player_save_dir(chunk_path), player)?;
+            }
+        }
         Ok(())
     }
 
@@ -745,14 +931,30 @@ impl GameServerState {
         username: &str,
         entity_id: EntityId,
     ) -> Result<Option<PlayerState>> {
-        let Some(chunk_path) = self.world_save_dir.as_ref() else {
-            return Ok(None);
-        };
-        read_player_file(
-            &player_file_path(&player_save_dir(chunk_path), username),
-            entity_id,
-        )
-        .map_err(ServerError::Io)
+        match self.world_storage_mode {
+            WorldStorageMode::VanillaBeta173 => {
+                let Some(world_dir) = self.world_root_dir.as_ref() else {
+                    return Ok(None);
+                };
+                read_vanilla_player_file(
+                    &vanilla_player_file_path(world_dir, username),
+                    username,
+                    entity_id,
+                    self.spawn_position(),
+                )
+                .map_err(ServerError::Io)
+            }
+            _ => {
+                let Some(chunk_path) = self.world_save_dir.as_ref() else {
+                    return Ok(None);
+                };
+                read_player_file(
+                    &player_file_path(&player_save_dir(chunk_path), username),
+                    entity_id,
+                )
+                .map_err(ServerError::Io)
+            }
+        }
     }
 
     pub fn register_player(&mut self, username: impl Into<String>) -> EntityId {
@@ -760,7 +962,13 @@ impl GameServerState {
         if let Some(id) = self.players.get(&username) {
             return *id;
         }
-        let id = self.entities.spawn(EntityKind::Player, 0.5, 66.0, 0.5);
+        let spawn = self.spawn_position();
+        let id = self.entities.spawn(
+            EntityKind::Player,
+            spawn.x as f64 + 0.5,
+            spawn.y as f64,
+            spawn.z as f64 + 0.5,
+        );
         self.players.insert(username, id);
         id
     }
@@ -784,10 +992,31 @@ impl GameServerState {
     }
 
     pub fn spawn_passive_mobs_near_spawn(&mut self) -> Vec<EntityId> {
+        let spawn = self.spawn_position();
+        let x = spawn.x as f64 + 0.5;
+        let y = spawn.y as f64;
+        let z = spawn.z as f64 + 0.5;
         vec![
-            self.entities.spawn(EntityKind::Pig, 4.5, 65.0, 4.5),
-            self.entities.spawn(EntityKind::Cow, -4.5, 65.0, 4.5),
+            self.entities.spawn(EntityKind::Pig, x + 4.0, y, z + 4.0),
+            self.entities.spawn(EntityKind::Cow, x - 4.0, y, z + 4.0),
         ]
+    }
+
+    fn save_level_dat(&mut self) -> Result<()> {
+        let (Some(world_dir), Some(level_dat)) =
+            (self.world_root_dir.as_ref(), self.level_dat.as_mut())
+        else {
+            return Ok(());
+        };
+        level_dat.set_time(self.world.time());
+        level_dat
+            .save(&world_dir.join("level.dat"))
+            .map_err(|error| {
+                ServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            })
     }
 }
 
@@ -1223,6 +1452,63 @@ fn is_placeable_block_id(item_id: i16) -> bool {
     item_rules::item_rule(item_id).is_placeable() && (0..=u8::MAX as i16).contains(&item_id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AxisAlignedBox {
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    max_x: f64,
+    max_y: f64,
+    max_z: f64,
+}
+
+impl AxisAlignedBox {
+    fn player(player: &PlayerState) -> Self {
+        const PLAYER_HALF_WIDTH: f64 = 0.3;
+        const PLAYER_HEIGHT: f64 = 1.8;
+        Self {
+            min_x: player.x - PLAYER_HALF_WIDTH,
+            min_y: player.y,
+            min_z: player.z - PLAYER_HALF_WIDTH,
+            max_x: player.x + PLAYER_HALF_WIDTH,
+            max_y: player.y + PLAYER_HEIGHT,
+            max_z: player.z + PLAYER_HALF_WIDTH,
+        }
+    }
+
+    fn full_block(pos: BlockPos) -> Self {
+        let x = pos.x as f64;
+        let y = pos.y as f64;
+        let z = pos.z as f64;
+        Self {
+            min_x: x,
+            min_y: y,
+            min_z: z,
+            max_x: x + 1.0,
+            max_y: y + 1.0,
+            max_z: z + 1.0,
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.min_x < other.max_x
+            && self.max_x > other.min_x
+            && self.min_y < other.max_y
+            && self.max_y > other.min_y
+            && self.min_z < other.max_z
+            && self.max_z > other.min_z
+    }
+}
+
+fn solid_block_intersects_player(player: Option<&PlayerState>, pos: BlockPos) -> bool {
+    let Some(player) = player else {
+        return false;
+    };
+    // TODO: Use Beta 1.7.3 shape-specific collision boxes for slabs, stairs,
+    // doors, fences, and other partial solid blocks.
+    AxisAlignedBox::full_block(pos).intersects(AxisAlignedBox::player(player))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerState {
     pub username: String,
@@ -1272,6 +1558,20 @@ impl PlayerState {
             crouching: false,
             inventory: PlayerInventory::starter(),
         }
+    }
+
+    pub fn new_at_spawn(username: impl Into<String>, entity_id: EntityId, spawn: BlockPos) -> Self {
+        let mut player = Self::new(username, entity_id);
+        player.spawn_x = spawn.x as f64 + 0.5;
+        player.spawn_y = spawn.y as f64;
+        player.spawn_z = spawn.z as f64 + 0.5;
+        player.x = player.spawn_x;
+        player.y = player.spawn_y;
+        player.stance = player.y + 1.62;
+        player.z = player.spawn_z;
+        player.current_chunk =
+            ChunkPos::from_block(player.x.floor() as i32, player.z.floor() as i32);
+        player
     }
 
     pub fn apply_movement(&mut self, movement: ServerboundMovementPacket) {
@@ -1504,6 +1804,270 @@ fn read_player_file(path: &Path, entity_id: EntityId) -> io::Result<Option<Playe
     }))
 }
 
+fn vanilla_player_file_path(world_dir: &Path, username: &str) -> PathBuf {
+    world_dir.join("players").join(format!("{username}.dat"))
+}
+
+fn read_vanilla_player_file(
+    path: &Path,
+    username: &str,
+    entity_id: EntityId,
+    world_spawn: BlockPos,
+) -> io::Result<Option<PlayerState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let document = vanilla_beta173::read_gzip_nbt_file(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let root = &document.root;
+    let mut player = PlayerState::new_at_spawn(username.to_string(), entity_id, world_spawn);
+
+    if let Some(values) = nbt_list(root, "Pos", nbt::TAG_DOUBLE) {
+        if values.len() >= 3 {
+            player.x = tag_f64(&values[0]).unwrap_or(player.x);
+            player.y = tag_f64(&values[1]).unwrap_or(player.y);
+            player.z = tag_f64(&values[2]).unwrap_or(player.z);
+            player.stance = player.y + 1.62;
+        }
+    }
+    if let Some(values) = nbt_list(root, "Rotation", nbt::TAG_FLOAT) {
+        if values.len() >= 2 {
+            player.yaw = tag_f32(&values[0]).unwrap_or(player.yaw);
+            player.pitch = tag_f32(&values[1]).unwrap_or(player.pitch);
+        }
+    }
+    if let Some(health) = root.get("Health").and_then(tag_i32) {
+        player.health = health.clamp(0, 20);
+        player.life_state = if player.health == 0 {
+            PlayerLifeState::Dead
+        } else {
+            PlayerLifeState::Alive
+        };
+    }
+    if let (Some(x), Some(y), Some(z)) = (
+        root.get("SpawnX").and_then(tag_i32),
+        root.get("SpawnY").and_then(tag_i32),
+        root.get("SpawnZ").and_then(tag_i32),
+    ) {
+        player.spawn_x = x as f64 + 0.5;
+        player.spawn_y = y as f64;
+        player.spawn_z = z as f64 + 0.5;
+    }
+    if let Some(dimension) = root.get("Dimension").and_then(tag_i32) {
+        if dimension != 0 {
+            eprintln!(
+                "[world] vanilla player {username} has unsupported dimension {dimension}; using overworld position"
+            );
+        }
+    }
+
+    player.inventory = PlayerInventory::empty();
+    if let Some(entries) = nbt_list(root, "Inventory", nbt::TAG_COMPOUND) {
+        for entry in entries {
+            let Some(item) = entry.as_compound() else {
+                continue;
+            };
+            let Some(vanilla_slot) = item.get("Slot").and_then(tag_i8) else {
+                continue;
+            };
+            let Some(window_slot) = vanilla_inventory_slot_to_window_slot(vanilla_slot) else {
+                continue;
+            };
+            let Some(item_id) = item.get("id").and_then(tag_i16) else {
+                continue;
+            };
+            let count = item
+                .get("Count")
+                .and_then(tag_i8)
+                .map(|value| value.max(0) as u8)
+                .unwrap_or(0);
+            let damage = item.get("Damage").and_then(tag_i16).unwrap_or(0);
+            player
+                .inventory
+                .set_slot(window_slot, stack(item_id, count, damage));
+        }
+    }
+    player.inventory.set_selected_hotbar_slot(0);
+    player.selected_hotbar_slot = 0;
+    player.current_chunk = ChunkPos::from_block(player.x.floor() as i32, player.z.floor() as i32);
+    Ok(Some(player))
+}
+
+fn write_vanilla_player_file(path: &Path, player: &PlayerState) -> io::Result<()> {
+    let mut document = if path.exists() {
+        vanilla_beta173::read_gzip_nbt_file(path)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+    } else {
+        nbt::Document {
+            root_name: String::new(),
+            root: nbt::Compound::new(),
+        }
+    };
+
+    let preserved_inventory = preserved_unsupported_vanilla_inventory(&document.root);
+    let root = &mut document.root;
+    root.insert(
+        "Pos".to_string(),
+        nbt::Tag::List {
+            element_type: nbt::TAG_DOUBLE,
+            elements: vec![
+                nbt::Tag::Double(player.x),
+                nbt::Tag::Double(player.y),
+                nbt::Tag::Double(player.z),
+            ],
+        },
+    );
+    root.insert(
+        "Motion".to_string(),
+        root.get("Motion").cloned().unwrap_or(nbt::Tag::List {
+            element_type: nbt::TAG_DOUBLE,
+            elements: vec![
+                nbt::Tag::Double(0.0),
+                nbt::Tag::Double(0.0),
+                nbt::Tag::Double(0.0),
+            ],
+        }),
+    );
+    root.insert(
+        "Rotation".to_string(),
+        nbt::Tag::List {
+            element_type: nbt::TAG_FLOAT,
+            elements: vec![nbt::Tag::Float(player.yaw), nbt::Tag::Float(player.pitch)],
+        },
+    );
+    root.insert(
+        "Health".to_string(),
+        nbt::Tag::Short(player.health.clamp(0, i16::MAX as i32) as i16),
+    );
+    root.insert("Dimension".to_string(), nbt::Tag::Int(0));
+    root.insert(
+        "SpawnX".to_string(),
+        nbt::Tag::Int(player.spawn_x.floor() as i32),
+    );
+    root.insert(
+        "SpawnY".to_string(),
+        nbt::Tag::Int(player.spawn_y.floor() as i32),
+    );
+    root.insert(
+        "SpawnZ".to_string(),
+        nbt::Tag::Int(player.spawn_z.floor() as i32),
+    );
+
+    let mut inventory = preserved_inventory;
+    for (window_slot, slot) in player.inventory.slots().iter().copied().enumerate() {
+        let Some(vanilla_slot) = window_slot_to_vanilla_inventory_slot(window_slot as i16) else {
+            continue;
+        };
+        let LegacySlotData::Present {
+            item_id,
+            count,
+            damage,
+        } = slot
+        else {
+            continue;
+        };
+        let mut item = nbt::Compound::new();
+        item.insert("Slot".to_string(), nbt::Tag::Byte(vanilla_slot));
+        item.insert("id".to_string(), nbt::Tag::Short(item_id));
+        item.insert("Count".to_string(), nbt::Tag::Byte(count as i8));
+        item.insert("Damage".to_string(), nbt::Tag::Short(damage));
+        inventory.push(nbt::Tag::Compound(item));
+    }
+    root.insert(
+        "Inventory".to_string(),
+        nbt::Tag::List {
+            element_type: nbt::TAG_COMPOUND,
+            elements: inventory,
+        },
+    );
+
+    vanilla_beta173::write_gzip_nbt_file(path, &document)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn preserved_unsupported_vanilla_inventory(root: &nbt::Compound) -> Vec<nbt::Tag> {
+    nbt_list(root, "Inventory", nbt::TAG_COMPOUND)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|entry| {
+            let Some(item) = entry.as_compound() else {
+                return true;
+            };
+            item.get("Slot")
+                .and_then(tag_i8)
+                .and_then(vanilla_inventory_slot_to_window_slot)
+                .is_none()
+        })
+        .cloned()
+        .collect()
+}
+
+fn nbt_list<'a>(
+    compound: &'a nbt::Compound,
+    name: &str,
+    expected_element_type: u8,
+) -> Option<&'a [nbt::Tag]> {
+    let (element_type, values) = compound.get(name)?.as_list()?;
+    (element_type == expected_element_type).then_some(values)
+}
+
+fn tag_i8(tag: &nbt::Tag) -> Option<i8> {
+    match tag {
+        nbt::Tag::Byte(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn tag_i16(tag: &nbt::Tag) -> Option<i16> {
+    match tag {
+        nbt::Tag::Short(value) => Some(*value),
+        nbt::Tag::Byte(value) => Some(i16::from(*value)),
+        _ => None,
+    }
+}
+
+fn tag_i32(tag: &nbt::Tag) -> Option<i32> {
+    match tag {
+        nbt::Tag::Int(value) => Some(*value),
+        nbt::Tag::Short(value) => Some(i32::from(*value)),
+        nbt::Tag::Byte(value) => Some(i32::from(*value)),
+        _ => None,
+    }
+}
+
+fn tag_f32(tag: &nbt::Tag) -> Option<f32> {
+    match tag {
+        nbt::Tag::Float(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn tag_f64(tag: &nbt::Tag) -> Option<f64> {
+    match tag {
+        nbt::Tag::Double(value) => Some(*value),
+        nbt::Tag::Float(value) => Some(f64::from(*value)),
+        _ => None,
+    }
+}
+
+fn vanilla_inventory_slot_to_window_slot(slot: i8) -> Option<i16> {
+    match slot {
+        0..=8 => Some(i16::from(slot) + PlayerInventory::HOTBAR_START_SLOT as i16),
+        9..=35 => Some(i16::from(slot)),
+        100..=103 => Some(5 + i16::from(slot - 100)),
+        _ => None,
+    }
+}
+
+fn window_slot_to_vanilla_inventory_slot(slot: i16) -> Option<i8> {
+    match slot {
+        5..=8 => Some((100 + (slot - 5)) as i8),
+        9..=35 => Some(slot as i8),
+        36..=44 => Some((slot - 36) as i8),
+        _ => None,
+    }
+}
+
 fn parse_saved_slot(value: &str) -> io::Result<LegacySlotData> {
     if value == "empty" {
         return Ok(LegacySlotData::Empty);
@@ -1608,6 +2172,7 @@ enum PlacementRejection {
     TargetNotAir,
     ClickedBlockMissing,
     OutOfReach,
+    PlayerCollision,
 }
 
 impl PlacementRejection {
@@ -1620,6 +2185,7 @@ impl PlacementRejection {
             Self::TargetNotAir => "target-not-air",
             Self::ClickedBlockMissing => "clicked-block-missing",
             Self::OutOfReach => "out-of-reach",
+            Self::PlayerCollision => "player-collision",
         }
     }
 }
@@ -1645,7 +2211,6 @@ pub struct PlayerSession {
     last_time_sent_at: Instant,
     joined_ready_movement_packets: u32,
     inventory_sync_sent: bool,
-    next_keepalive_id: i32,
     pending_keepalive_id: Option<i32>,
     last_keepalive_received: Option<KeepAliveReceive>,
     last_time_update_tick: Option<u64>,
@@ -1685,7 +2250,6 @@ impl PlayerSession {
             last_time_sent_at: now,
             joined_ready_movement_packets: 0,
             inventory_sync_sent: false,
-            next_keepalive_id: 1,
             pending_keepalive_id: None,
             last_keepalive_received: None,
             last_time_update_tick: None,
@@ -1845,17 +2409,18 @@ impl PlayerSession {
         }
 
         let username = login.username;
-        let (entity_id, saved_player) = {
+        let (_entity_id, saved_player, default_player) = {
             let mut state = self
                 .state_ref
                 .lock()
                 .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
             let entity_id = state.register_player(username.clone());
             let saved_player = state.load_player_state(&username, entity_id)?;
-            (entity_id, saved_player)
+            let default_player = state.new_player_state(username.clone(), entity_id);
+            (entity_id, saved_player, default_player)
         };
         self.registered_username = Some(username.clone());
-        self.player = saved_player.or_else(|| Some(PlayerState::new(username, entity_id)));
+        self.player = saved_player.or(Some(default_player));
         self.send_join_sequence(connection)?;
         self.state = ConnectionState::Joined;
         Ok(None)
@@ -2042,9 +2607,14 @@ impl PlayerSession {
         login_response.entity_id = entity_id;
 
         self.write_clientbound_login_response(connection, &login_response)?;
+        let spawn = self.with_game_state(|state| Ok(state.spawn_position()))?;
         self.write_clientbound_frame(connection, ClientboundSpawnPositionPacket::ID, |payload| {
             ClientboundSpawnPositionPacketCodec::encode(
-                &ClientboundSpawnPositionPacket::default_spawn(),
+                &ClientboundSpawnPositionPacket {
+                    x: spawn.x,
+                    y: spawn.y,
+                    z: spawn.z,
+                },
                 payload,
             )
         })?;
@@ -2166,7 +2736,9 @@ impl PlayerSession {
     }
 
     fn chunk_radius(&self) -> i32 {
-        if self.config.playable_flat_world {
+        if self.config.playable_flat_world
+            || self.config.world_storage_mode == WorldStorageMode::VanillaBeta173
+        {
             self.config.initial_chunk_radius
         } else {
             0
@@ -2588,6 +3160,12 @@ impl PlayerSession {
         }
         if target_state != Some(BlockState::AIR) {
             return Some(PlacementRejection::TargetNotAir);
+        }
+        let desired = selected_placeable_block(inventory);
+        if block_rules::block_rule(desired.id).solid
+            && solid_block_intersects_player(self.player.as_ref(), target)
+        {
+            return Some(PlacementRejection::PlayerCollision);
         }
         None
     }
@@ -3025,15 +3603,13 @@ impl PlayerSession {
         {
             return Ok(());
         }
-        let id = self.next_keepalive_id;
-        self.next_keepalive_id = self.next_keepalive_id.wrapping_add(1).max(1);
-        self.pending_keepalive_id = Some(id);
         self.write_clientbound_frame(connection, KeepAlivePacket::ID, |payload| {
-            KeepAlivePacket { keep_alive_id: id }.encode(payload)
+            KeepAlivePacket.encode(payload)
         })?;
+        self.pending_keepalive_id = None;
         self.last_keepalive_sent_at = Instant::now();
         eprintln!(
-            "[session] sent keepalive id={id} player={}",
+            "[session] sent keepalive payload=<empty> player={}",
             self.player_name_for_log()
         );
         Ok(())
@@ -3074,18 +3650,21 @@ impl PlayerSession {
         match self.config.keepalive_mode {
             KeepAliveMode::Off | KeepAliveMode::ServerboundNoPayload => {
                 self.trace_packet(PacketDirection::ClientToServer, KeepAlivePacket::ID, &[]);
+                let matched_expected =
+                    self.config.keepalive_mode == KeepAliveMode::ServerboundNoPayload;
+                self.pending_keepalive_id = None;
                 self.last_keepalive_received = Some(KeepAliveReceive {
                     id: None,
                     raw: [0; 4],
                     raw_len: 0,
-                    matched_expected: self.config.keepalive_mode
-                        == KeepAliveMode::ServerboundNoPayload,
+                    matched_expected,
                     likely_packet_bytes: false,
                 });
                 if self.config.packet_tracing_enabled {
                     eprintln!(
-                        "[session] received keepalive mode={} rawPayload=<empty> matchedExpected=true likelyPacketBytes=false pendingSent={:?} player={}",
+                        "[session] received keepalive mode={} rawPayload=<empty> matchedExpected={} likelyPacketBytes=false pendingSent={:?} player={}",
                         self.config.keepalive_mode.as_str(),
+                        matched_expected,
                         self.pending_keepalive_id,
                         self.player_name_for_log()
                     );
@@ -3099,14 +3678,14 @@ impl PlayerSession {
                     KeepAlivePacket::ID,
                     &payload,
                 );
-                let packet = KeepAlivePacket::decode(&mut payload.as_slice())?;
-                let matched = self.pending_keepalive_id == Some(packet.keep_alive_id);
+                let keep_alive_id = i32::from_be_bytes(payload);
+                let matched = self.pending_keepalive_id == Some(keep_alive_id);
                 if matched {
                     self.pending_keepalive_id = None;
                 }
                 let likely_packet_bytes = looks_like_repeated_player_packet_bytes(&payload);
                 self.last_keepalive_received = Some(KeepAliveReceive {
-                    id: Some(packet.keep_alive_id),
+                    id: Some(keep_alive_id),
                     raw: payload,
                     raw_len: payload.len(),
                     matched_expected: matched,
@@ -3115,7 +3694,7 @@ impl PlayerSession {
                 eprintln!(
                     "[session] received keepalive mode={} id={} rawPayload={} matchedExpected={} likelyPacketBytes={} pendingSent={:?} player={}",
                     self.config.keepalive_mode.as_str(),
-                    packet.keep_alive_id,
+                    keep_alive_id,
                     trace::format_payload_hex(&payload),
                     matched,
                     likely_packet_bytes,
@@ -3150,8 +3729,8 @@ impl PlayerSession {
                     x: pos.x,
                     y: pos.y as u8,
                     z: pos.z,
-                    block_type: i16::from(state.id),
-                    metadata: i32::from(state.metadata),
+                    block_type: state.id,
+                    metadata: state.metadata,
                 },
                 payload,
             )
@@ -3844,7 +4423,18 @@ impl ServerBootstrap {
     }
 
     pub fn start(self) -> Result<RunningServer> {
-        let state = GameServerState::shared_flat_persistent(world_save_dir(&self.config))?;
+        let mut config = self.config;
+        let requested_world_format = config.world_storage_mode;
+        let resolved_world_format = resolve_world_storage_mode(&config)?;
+        config.world_storage_mode = resolved_world_format;
+        let state = match resolved_world_format {
+            WorldStorageMode::VanillaBeta173 => {
+                GameServerState::shared_vanilla_beta173(world_root_dir(&config))?
+            }
+            WorldStorageMode::AureliaFlat | WorldStorageMode::Auto => {
+                GameServerState::shared_flat_persistent(world_save_dir(&config))?
+            }
+        };
         {
             let mut state = state
                 .lock()
@@ -3854,10 +4444,15 @@ impl ServerBootstrap {
         let _regions = RegionScheduler::default();
         eprintln!("Starting Aurelia {VERSION}");
         eprintln!("Target compatibility: {TARGET_VERSION}");
-        eprintln!("World: {}", self.config.world_name);
-        eprintln!("Bind address: {}:{}", self.config.host, self.config.port);
+        eprintln!("World: {}", config.world_name);
+        eprintln!(
+            "World format: {} (requested {})",
+            resolved_world_format.as_str(),
+            requested_world_format.as_str()
+        );
+        eprintln!("Bind address: {}:{}", config.host, config.port);
 
-        let listener = TcpListener::bind((self.config.host.as_str(), self.config.port))?;
+        let listener = TcpListener::bind((config.host.as_str(), config.port))?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let listener = Arc::new(listener);
@@ -3866,7 +4461,7 @@ impl ServerBootstrap {
         let worker = spawn_accept_loop(
             Arc::clone(&listener),
             Arc::clone(&running),
-            self.config.clone(),
+            config.clone(),
             Arc::clone(&state),
         );
 
@@ -4183,6 +4778,80 @@ mod tests {
             legacy.login_response_mode
         );
         assert!(parse_config(&["--login-response-mode=nope"]).is_err());
+    }
+
+    #[test]
+    fn parses_world_format_flags() {
+        let empty_args: [&str; 0] = [];
+        let default = parse_config(&empty_args).unwrap();
+        let flat = parse_config(&["--world-format=aurelia-flat"]).unwrap();
+        let vanilla = parse_config(&["--world-format", "vanilla-beta173"]).unwrap();
+
+        assert_eq!(WorldStorageMode::Auto, default.world_storage_mode);
+        assert_eq!(WorldStorageMode::AureliaFlat, flat.world_storage_mode);
+        assert_eq!(WorldStorageMode::VanillaBeta173, vanilla.world_storage_mode);
+        assert!(parse_config(&["--world-format=nope"]).is_err());
+    }
+
+    #[test]
+    fn auto_world_format_detection_selects_vanilla_flat_or_new_flat_worlds() {
+        let vanilla_dir = test_server_world_dir("auto-vanilla");
+        let flat_dir = test_server_world_dir("auto-flat");
+        let empty_dir = test_server_world_dir("auto-empty");
+        let _ = std::fs::remove_dir_all(&vanilla_dir);
+        let _ = std::fs::remove_dir_all(&flat_dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
+
+        write_synthetic_level_dat(&vanilla_dir, BlockPos::new(10, 70, -5), 123).unwrap();
+        std::fs::create_dir_all(vanilla_dir.join("region")).unwrap();
+        std::fs::write(vanilla_dir.join("region").join("r.0.0.mcr"), vec![0; 8192]).unwrap();
+
+        let flat_save_dir = flat_dir.join("aurelia-flat-v1");
+        std::fs::create_dir_all(&flat_save_dir).unwrap();
+        std::fs::write(
+            flat_save_dir.join("c.0.0.achunk"),
+            b"not-loaded-by-detection",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&empty_dir).unwrap();
+
+        let vanilla_config = parse_config(&[
+            "--world",
+            vanilla_dir.to_str().unwrap(),
+            "--world-format=auto",
+        ])
+        .unwrap();
+        let flat_config = parse_config(&["--world", flat_dir.to_str().unwrap()]).unwrap();
+        let empty_config = parse_config(&[
+            "--world",
+            empty_dir.to_str().unwrap(),
+            "--playable-flat-world",
+        ])
+        .unwrap();
+        let missing_vanilla = parse_config(&[
+            "--world",
+            empty_dir.to_str().unwrap(),
+            "--world-format=vanilla-beta173",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            WorldStorageMode::VanillaBeta173,
+            resolve_world_storage_mode(&vanilla_config).unwrap()
+        );
+        assert_eq!(
+            WorldStorageMode::AureliaFlat,
+            resolve_world_storage_mode(&flat_config).unwrap()
+        );
+        assert_eq!(
+            WorldStorageMode::AureliaFlat,
+            resolve_world_storage_mode(&empty_config).unwrap()
+        );
+        assert!(resolve_world_storage_mode(&missing_vanilla).is_err());
+
+        let _ = std::fs::remove_dir_all(&vanilla_dir);
+        let _ = std::fs::remove_dir_all(&flat_dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
     }
 
     #[test]
@@ -4615,6 +5284,27 @@ mod tests {
             None,
             first_packet_position(&stream.written, ClientboundSetWindowItemsPacket::ID)
         );
+    }
+
+    #[test]
+    fn beta173_clientbound_keepalive_is_single_packet_id_byte() {
+        let mut session = PlayerSession::new(playable_config(0));
+        session.join_phase = JoinPhase::JoinedReady;
+        let mut output = Vec::new();
+
+        session.send_keepalive(&mut output).unwrap();
+
+        assert_eq!(vec![KeepAlivePacket::ID], output);
+        assert_eq!(
+            Some(0),
+            first_packet_payload_length(&output, KeepAlivePacket::ID)
+        );
+        assert_eq!(
+            Some(KeepAlivePacket::ID),
+            session.last_clientbound_packet_id
+        );
+        assert_eq!(0, session.last_clientbound_payload_len);
+        assert_eq!(None, session.pending_keepalive_id);
     }
 
     #[test]
@@ -5833,6 +6523,15 @@ mod tests {
             BlockState::AIR,
             state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
         );
+        assert!(
+            block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
+                x: 0,
+                y: 63,
+                z: 0,
+                block_type: 2,
+                metadata: 0,
+            })
+        );
         assert!(set_slot_packets(&stream.written)
             .iter()
             .any(|packet| packet.window_id == 0
@@ -5843,6 +6542,140 @@ mod tests {
                         count: 1,
                         damage: 0,
                     }));
+    }
+
+    #[test]
+    fn rejected_placement_inside_player_collision_box_corrects_without_decrement_or_world_mutation()
+    {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        move_player_to(&mut session, 0.5, 64.0, 0.5);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: stack(3, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            "player-collision",
+            PlacementRejection::PlayerCollision.as_str()
+        );
+        assert_eq!(
+            stack(3, 64, 0),
+            session.player().unwrap().inventory.slots()[36]
+        );
+        assert_eq!(
+            BlockState::AIR,
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+        let changes = block_changes(&stream.written);
+        assert!(changes.contains(&ClientboundBlockChangePacket {
+            x: 0,
+            y: 63,
+            z: 0,
+            block_type: 2,
+            metadata: 0,
+        }));
+        assert!(changes.contains(&ClientboundBlockChangePacket {
+            x: 0,
+            y: 64,
+            z: 0,
+            block_type: 0,
+            metadata: 0,
+        }));
+        assert!(set_slot_packets(&stream.written)
+            .iter()
+            .any(|packet| packet.window_id == 0
+                && packet.slot == 36
+                && packet.slot_data == stack(3, 64, 0)));
+    }
+
+    #[test]
+    fn solid_block_adjacent_to_player_collision_box_can_be_placed() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        move_player_to(&mut session, 0.5, 64.0, 0.5);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 1,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: stack(3, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            stack(3, 63, 0),
+            session.player().unwrap().inventory.slots()[36]
+        );
+        assert_eq!(
+            BlockState::DIRT,
+            state.lock().unwrap().block_at(BlockPos::new(1, 64, 0))
+        );
+        assert!(
+            block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
+                x: 1,
+                y: 64,
+                z: 0,
+                block_type: 3,
+                metadata: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn non_solid_placeable_block_inside_player_collision_box_can_be_placed() {
+        let state = GameServerState::shared_flat();
+        let mut session = ready_session_with_state(Arc::clone(&state));
+        move_player_to(&mut session, 0.5, 64.0, 0.5);
+        session.player.as_mut().unwrap().set_hotbar_slot(3);
+        let mut stream = Duplex::new(Vec::new());
+
+        session
+            .handle_player_block_placement(
+                ServerboundPlayerBlockPlacementPacket {
+                    x: 0,
+                    y: 63,
+                    z: 0,
+                    direction: 1,
+                    held_item: stack(50, 1, 0),
+                },
+                &mut stream,
+            )
+            .unwrap();
+
+        assert_eq!(
+            stack(50, 63, 0),
+            session.player().unwrap().inventory.slots()[39]
+        );
+        assert_eq!(
+            BlockState::new_unchecked(50, 0),
+            state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+        assert!(
+            block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
+                x: 0,
+                y: 64,
+                z: 0,
+                block_type: 50,
+                metadata: 0,
+            })
+        );
     }
 
     #[test]
@@ -5898,6 +6731,15 @@ mod tests {
         assert_eq!(
             BlockState::AIR,
             state.lock().unwrap().block_at(BlockPos::new(0, 64, 0))
+        );
+        assert!(
+            block_changes(&stream.written).contains(&ClientboundBlockChangePacket {
+                x: 0,
+                y: 63,
+                z: 0,
+                block_type: 2,
+                metadata: 0,
+            })
         );
         assert!(set_slot_packets(&stream.written)
             .iter()
@@ -6210,6 +7052,78 @@ mod tests {
     }
 
     #[test]
+    fn vanilla_level_dat_initializes_spawn_and_time_and_saves_time() {
+        let dir = test_server_world_dir("vanilla-level");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(12, 70, -4), 6000).unwrap();
+        let mut state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+
+        assert_eq!(WorldStorageMode::VanillaBeta173, state.world_storage_mode());
+        assert_eq!(BlockPos::new(12, 70, -4), state.spawn_position());
+        assert_eq!(6000, state.world_time());
+
+        state.set_world_time(7000);
+        state.save_dirty_chunks().unwrap();
+
+        let level = LevelDat::load(&dir.join("level.dat")).unwrap();
+        assert_eq!(7000, level.time());
+        assert_eq!((12, 70, -4), level.spawn().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanilla_player_file_loads_and_round_trips_core_state_and_inventory() {
+        let dir = test_server_world_dir("vanilla-player");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_synthetic_level_dat(&dir, BlockPos::new(0, 65, 0), 0).unwrap();
+        write_synthetic_vanilla_player(&dir, "TestUser").unwrap();
+        let state = GameServerState::new_vanilla_beta173(&dir).unwrap();
+
+        let mut loaded = state
+            .load_player_state("TestUser", EntityId::new(7))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(EntityId::new(7), loaded.entity_id);
+        assert_eq!(12.5, loaded.x);
+        assert_eq!(70.0, loaded.y);
+        assert_eq!(-3.5, loaded.z);
+        assert_eq!(90.0, loaded.yaw);
+        assert_eq!(10.0, loaded.pitch);
+        assert_eq!(6, loaded.health);
+        assert_eq!(stack(3, 12, 2), loaded.inventory.slots()[36]);
+        assert_eq!(stack(4, 5, 0), loaded.inventory.slots()[9]);
+
+        loaded.x = 20.5;
+        loaded.y = 71.0;
+        loaded.z = 2.5;
+        loaded.inventory.set_slot(36, stack(5, 9, 0));
+        state.save_player_state(&loaded).unwrap();
+
+        let reloaded = state
+            .load_player_state("TestUser", EntityId::new(8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(20.5, reloaded.x);
+        assert_eq!(71.0, reloaded.y);
+        assert_eq!(2.5, reloaded.z);
+        assert_eq!(stack(5, 9, 0), reloaded.inventory.slots()[36]);
+
+        let document =
+            vanilla_beta173::read_gzip_nbt_file(&vanilla_player_file_path(&dir, "TestUser"))
+                .unwrap();
+        let inventory = nbt_list(&document.root, "Inventory", nbt::TAG_COMPOUND).unwrap();
+        assert!(inventory.iter().any(|entry| {
+            entry
+                .as_compound()
+                .and_then(|item| item.get("Slot"))
+                .and_then(tag_i8)
+                == Some(-1)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn chat_commands_and_echo_respond_without_disconnect() {
         let mut session = PlayerSession::new(playable_config(0));
         let mut input = encoded_handshake("Luxorium");
@@ -6337,6 +7251,15 @@ mod tests {
         session
     }
 
+    fn move_player_to(session: &mut PlayerSession, x: f64, y: f64, z: f64) {
+        let player = session.player.as_mut().unwrap();
+        player.x = x;
+        player.y = y;
+        player.stance = y + 1.62;
+        player.z = z;
+        player.current_chunk = ChunkPos::from_block(x.floor() as i32, z.floor() as i32);
+    }
+
     fn inventory_count(player: &PlayerState, item_id: i16) -> u32 {
         player
             .inventory
@@ -6359,6 +7282,82 @@ mod tests {
 
     fn world_save_dir_for_test(dir: &Path) -> PathBuf {
         dir.join("aurelia-flat-v1")
+    }
+
+    fn write_synthetic_level_dat(dir: &Path, spawn: BlockPos, time: u64) -> io::Result<()> {
+        let mut data = nbt::Compound::new();
+        data.insert(
+            "LevelName".to_string(),
+            nbt::Tag::String("AureliaTest".to_string()),
+        );
+        data.insert("RandomSeed".to_string(), nbt::Tag::Long(12345));
+        data.insert("SpawnX".to_string(), nbt::Tag::Int(spawn.x));
+        data.insert("SpawnY".to_string(), nbt::Tag::Int(spawn.y));
+        data.insert("SpawnZ".to_string(), nbt::Tag::Int(spawn.z));
+        data.insert("Time".to_string(), nbt::Tag::Long(time as i64));
+        data.insert("LastPlayed".to_string(), nbt::Tag::Long(1));
+        data.insert("version".to_string(), nbt::Tag::Int(19132));
+        let mut root = nbt::Compound::new();
+        root.insert("Data".to_string(), nbt::Tag::Compound(data));
+        let document = nbt::Document {
+            root_name: "Data".to_string(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&dir.join("level.dat"), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn write_synthetic_vanilla_player(dir: &Path, username: &str) -> io::Result<()> {
+        let mut root = nbt::Compound::new();
+        root.insert(
+            "Pos".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_DOUBLE,
+                elements: vec![
+                    nbt::Tag::Double(12.5),
+                    nbt::Tag::Double(70.0),
+                    nbt::Tag::Double(-3.5),
+                ],
+            },
+        );
+        root.insert(
+            "Rotation".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_FLOAT,
+                elements: vec![nbt::Tag::Float(90.0), nbt::Tag::Float(10.0)],
+            },
+        );
+        root.insert("Health".to_string(), nbt::Tag::Short(6));
+        root.insert("Dimension".to_string(), nbt::Tag::Int(0));
+        root.insert("SpawnX".to_string(), nbt::Tag::Int(1));
+        root.insert("SpawnY".to_string(), nbt::Tag::Int(66));
+        root.insert("SpawnZ".to_string(), nbt::Tag::Int(2));
+        root.insert(
+            "Inventory".to_string(),
+            nbt::Tag::List {
+                element_type: nbt::TAG_COMPOUND,
+                elements: vec![
+                    vanilla_inventory_entry(0, 3, 12, 2),
+                    vanilla_inventory_entry(9, 4, 5, 0),
+                    vanilla_inventory_entry(-1, 280, 1, 0),
+                ],
+            },
+        );
+        let document = nbt::Document {
+            root_name: String::new(),
+            root,
+        };
+        vanilla_beta173::write_gzip_nbt_file(&vanilla_player_file_path(dir, username), &document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn vanilla_inventory_entry(slot: i8, item_id: i16, count: u8, damage: i16) -> nbt::Tag {
+        let mut item = nbt::Compound::new();
+        item.insert("Slot".to_string(), nbt::Tag::Byte(slot));
+        item.insert("id".to_string(), nbt::Tag::Short(item_id));
+        item.insert("Count".to_string(), nbt::Tag::Byte(count as i8));
+        item.insert("Damage".to_string(), nbt::Tag::Short(damage));
+        nbt::Tag::Compound(item)
     }
 
     fn encoded_handshake(username: &str) -> Vec<u8> {
@@ -6495,9 +7494,7 @@ mod tests {
 
     fn encoded_keepalive(id: i32) -> Vec<u8> {
         let mut bytes = vec![KeepAlivePacket::ID];
-        KeepAlivePacket { keep_alive_id: id }
-            .encode(&mut bytes)
-            .unwrap();
+        aurelia_protocol::write_i32(&mut bytes, id).unwrap();
         bytes
     }
 
@@ -6577,7 +7574,7 @@ mod tests {
             id if id == ClientboundPlayerPositionLookPacket::ID => Some(&output[1 + 41..]),
             id if id == ClientboundChunkVisibilityPacket::ID => Some(&output[1 + 9..]),
             id if id == ClientboundChunkDataPacket::ID => Some(skip_chunk_data_frame(output)),
-            id if id == ClientboundBlockChangePacket::ID => Some(&output[1 + 15..]),
+            id if id == ClientboundBlockChangePacket::ID => Some(&output[1 + 11..]),
             id if id == DisconnectPacket::ID => {
                 let length = u16::from_be_bytes([output[1], output[2]]) as usize;
                 Some(&output[3 + (length * 2)..])
@@ -6664,7 +7661,7 @@ mod tests {
                     output = &output[1 + 41..];
                 }
                 ClientboundBlockChangePacket::ID => {
-                    output = &output[1 + 15..];
+                    output = &output[1 + 11..];
                 }
                 packet_id => panic!("unexpected packet id {packet_id:#04x}"),
             }
@@ -6704,15 +7701,15 @@ mod tests {
                     output = skip_chunk_data_frame(output);
                 }
                 ClientboundBlockChangePacket::ID => {
-                    let payload = &output[1..16];
+                    let payload = &output[1..12];
                     changes.push(ClientboundBlockChangePacket {
                         x: i32::from_be_bytes(payload[0..4].try_into().unwrap()),
                         y: payload[4],
                         z: i32::from_be_bytes(payload[5..9].try_into().unwrap()),
-                        block_type: i16::from_be_bytes(payload[9..11].try_into().unwrap()),
-                        metadata: i32::from_be_bytes(payload[11..15].try_into().unwrap()),
+                        block_type: payload[9],
+                        metadata: payload[10],
                     });
-                    output = &output[16..];
+                    output = &output[12..];
                 }
                 packet_id => panic!("unexpected packet id {packet_id:#04x}"),
             }
@@ -6775,7 +7772,7 @@ mod tests {
                     ClientboundSpawnPositionPacket::ID => output = &output[1 + 12..],
                     ClientboundPlayerPositionLookPacket::ID => output = &output[1 + 41..],
                     ClientboundChunkVisibilityPacket::ID => output = &output[1 + 9..],
-                    ClientboundBlockChangePacket::ID => output = &output[1 + 15..],
+                    ClientboundBlockChangePacket::ID => output = &output[1 + 11..],
                     packet_id => panic!("unexpected packet id {packet_id:#04x}"),
                 }
             }
@@ -6804,7 +7801,7 @@ mod tests {
             }
             id if id == ClientboundBeta173TimeUpdatePacket::ID => Some(&output[1 + 8..]),
             id if id == ClientboundConfirmTransactionPacket::ID => Some(&output[1 + 4..]),
-            id if id == KeepAlivePacket::ID => Some(&output[1 + 4..]),
+            id if id == KeepAlivePacket::ID => Some(&output[1..]),
             id if id == ChatPacket::ID => {
                 let length = u16::from_be_bytes([output[1], output[2]]) as usize;
                 Some(&output[3 + (length * 2)..])

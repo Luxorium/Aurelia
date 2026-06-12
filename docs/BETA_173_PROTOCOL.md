@@ -229,12 +229,16 @@ continues to show no terrain.
   `unusedOrSeed`, byte dimension.
 - Experimental `S->C 0x01` login response in two provisional modes.
 - Experimental `S->C 0x06` spawn position: three ints.
-- `0x00` KeepAlive: int keepalive ID.
+- `0x00` KeepAlive: no payload in either direction; the frame is only the
+  packet ID byte.
 - `0x03` Chat: legacy string, truncated to a short Beta-safe limit.
 - Experimental Beta 1.7.3 `S->C 0x04` time update: one long time value.
 - Experimental `S->C 0x0D` player position/look: doubles, floats, boolean.
 - Experimental `S->C 0x32` set chunk visibility: two ints and a boolean.
 - Experimental `S->C 0x33` chunk data: Beta block-region compressed packet.
+- `S->C 0x35` BlockChange: int x, unsigned byte y, int z, unsigned byte
+  block id, unsigned byte metadata. Payload length is 11 bytes; block id and
+  metadata are not encoded as modern wider fields.
 - Experimental `S->C 0x67` set slot: window ID, slot, legacy slot data.
 - Experimental `S->C 0x68` set window items: window ID, slot count, slot array.
 - Experimental `0x6A` confirm transaction: window ID, action number, accepted.
@@ -413,9 +417,8 @@ Experimental post-login tracing reads known C->S movement packets with fixed
 payload sizes, plus documented fixed interaction packets:
 
 - `0x0A Player`: 1 byte.
-- `0x00 KeepAlive`: controlled by `--keepalive-mode`; default
-  `serverbound-no-payload` consumes no payload, `serverbound-int32` consumes 4
-  bytes for trace comparison only.
+- `0x00 KeepAlive`: default Beta-compatible handling consumes no payload.
+  `serverbound-int32` consumes 4 bytes for trace comparison only.
 - `0x0B PlayerPosition`: 33 bytes.
 - `0x0C PlayerLook`: 9 bytes.
 - `0x0D PlayerPositionLook`: 41 bytes.

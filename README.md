@@ -9,7 +9,7 @@ Aurelia is a clean-room Minecraft Beta 1.7.3-compatible dedicated server rewrite
 
 Aurelia is currently at version `0.2.0`, the **Vanilla Parity Foundation** milestone.
 
-A real Beta 1.7.3 client can join the experimental flat-world path, receive chunks, move, cross chunk boundaries with chunk load/unload visibility updates, break and place blocks from a starter hotbar, use basic chat/debug commands, perform conservative inventory clicks, save dirty flat-world edits and basic player state, quit cleanly, and rejoin with saved edits.
+A real Beta 1.7.3 client can join the experimental world path, receive chunks, move, cross chunk boundaries with chunk load/unload visibility updates, break and place blocks from a starter hotbar, use basic chat/debug commands, perform conservative inventory clicks, save dirty world edits and basic player state, quit cleanly, and rejoin with saved edits. Aurelia can also load and save an initial clean-room subset of vanilla Beta 1.7.3 McRegion/NBT worlds.
 
 This is still an early compatibility foundation. Aurelia is not a complete Beta 1.7.3 server, and compatibility claims need clean-room evidence from tests, traces, public documentation, or independent observations.
 
@@ -24,6 +24,7 @@ This is still an early compatibility foundation. Aurelia is not a complete Beta 
 - Clean-room rule tables covering every Beta 1.7.3 block and item id, driving stack sizes, harvest requirements, and drops for survival break/place testing.
 - Dirty flat-world chunk persistence in an Aurelia-native format.
 - Basic player persistence for username, position, rotation, health, inventory, selected hotbar slot, and spawn position.
+- Initial vanilla Beta 1.7.3 world save foundation: `level.dat`, `region/*.mcr` chunk block IDs/metadata, and `players/<username>.dat` position/rotation/health/inventory.
 - Server-side health/death/fall/void foundations without unverified client-visible health/death packet claims.
 - Unit and socket-level regression tests across the workspace.
 
@@ -31,14 +32,14 @@ This is still an early compatibility foundation. Aurelia is not a complete Beta 
 
 - Verified production login response semantics.
 - Full production chunk streaming policy.
-- Vanilla McRegion/NBT world and player save parity.
 - Vanilla terrain generation, caves, ores, trees, biomes, and structures.
+- Full vanilla McRegion/NBT parity beyond the initial load/save foundation.
 - Crafting, workbenches, chests, furnaces, and full inventory transaction behavior.
 - Item entities, pickups, overflow drops, mobs, AI, combat, and visible entity packets.
 - Exact digging timing, tool durability, collision, replaceable-block rules, permissions, and full survival loop.
 - Redstone, fluids, weather, sleep, vanilla commands, operators, and multiplayer edge cases.
 
-Current persistence is Aurelia-native and not vanilla McRegion/NBT-compatible.
+Known vanilla save limitations: missing McRegion chunks are sent as air instead of generated with vanilla terrain; tile entities and entities are preserved as NBT where possible but are not functionally implemented; lighting arrays are preserved when present and placeholder-filled for new edited chunks, but lighting recalculation is not exact; Nether/DIM-1 is not supported; multiplayer edge cases are incomplete.
 
 ## Quick Start
 
@@ -58,6 +59,12 @@ Run the experimental real-client flat-world path:
 
 ```bash
 cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --playable-flat-world --chunk-radius 1 --compat-debug --trace-packets --trace-packet-limit 512
+```
+
+Run against an existing vanilla Beta 1.7.3-style world folder:
+
+```bash
+cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --world ./world --world-format=vanilla-beta173 --chunk-radius 1 --compat-debug
 ```
 
 For a smoke test of the experimental path without keeping the server running:
@@ -86,7 +93,7 @@ The current implementation is still an early foundation. The `aurelia-region` cr
 
 - [`aurelia-common`](aurelia-common) - shared coordinate types, chunk-view helpers, and early Beta 1.7.3 item rules.
 - [`aurelia-protocol`](aurelia-protocol) - clean-room packet models, codecs, trace metadata, and Beta 1.7.3 protocol constants.
-- [`aurelia-world`](aurelia-world) - flat-world chunks, block rules, world APIs, entity scaffolding, and Aurelia-native persistence.
+- [`aurelia-world`](aurelia-world) - chunk/block models, block rules, world APIs, entity scaffolding, Aurelia-native persistence, and initial vanilla Beta 1.7.3 NBT/McRegion storage.
 - [`aurelia-region`](aurelia-region) - future region ownership and scheduling foundation.
 - [`aurelia-server`](aurelia-server) - server configuration, TCP listener, player session loop, experimental join path, commands, inventory handling, and persistence integration.
 
@@ -99,9 +106,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a fuller overview.
 
 ## Roadmap Summary
 
-- `0.2.x`: harden the Vanilla Parity Foundation, verify login semantics, expand block/item rules, and add item entities.
+- `0.2.x`: harden the Vanilla Parity Foundation, verify login semantics, expand block/item rules, improve vanilla save compatibility, and add item entities.
 - `0.3.x`: containers, crafting, workbench UI, furnaces, and fuller inventory behavior.
-- `0.4.x`: vanilla-style terrain/worldgen and McRegion/NBT parity.
+- `0.4.x`: vanilla-style terrain/worldgen and deeper McRegion/NBT parity.
 - `0.5.x`: item entities, visible entity packets, passive animals, hostile mobs, AI, drops, and combat.
 - Later: redstone, fluids, weather, sleep, commands, permissions, multiplayer edge cases, and broader parity audits.
 

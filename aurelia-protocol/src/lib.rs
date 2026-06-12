@@ -362,21 +362,17 @@ impl PacketCodecRegistry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeepAlivePacket {
-    pub keep_alive_id: i32,
-}
+pub struct KeepAlivePacket;
 
 impl KeepAlivePacket {
     pub const ID: u8 = 0x00;
 
-    pub fn decode(input: &mut impl Read) -> Result<Self> {
-        Ok(Self {
-            keep_alive_id: read_i32(input)?,
-        })
+    pub fn decode(_input: &mut impl Read) -> Result<Self> {
+        Ok(Self)
     }
 
-    pub fn encode(&self, output: &mut impl Write) -> Result<()> {
-        write_i32(output, self.keep_alive_id)
+    pub fn encode(&self, _output: &mut impl Write) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -787,8 +783,8 @@ pub struct ClientboundBlockChangePacket {
     pub x: i32,
     pub y: u8,
     pub z: i32,
-    pub block_type: i16,
-    pub metadata: i32,
+    pub block_type: u8,
+    pub metadata: u8,
 }
 
 impl ClientboundBlockChangePacket {
@@ -802,8 +798,8 @@ impl ClientboundBlockChangePacketCodec {
         write_i32(output, packet.x)?;
         write_u8(output, packet.y)?;
         write_i32(output, packet.z)?;
-        write_i16(output, packet.block_type)?;
-        write_i32(output, packet.metadata)
+        write_u8(output, packet.block_type)?;
+        write_u8(output, packet.metadata)
     }
 }
 
@@ -1025,7 +1021,7 @@ impl ServerboundPacketKind {
 
     pub const fn fixed_payload_length(self) -> Option<usize> {
         match self {
-            Self::KeepAlive => Some(4),
+            Self::KeepAlive => Some(0),
             Self::Player => Some(1),
             Self::PlayerPosition => Some(33),
             Self::PlayerLook => Some(9),
@@ -1690,6 +1686,34 @@ mod tests {
     }
 
     #[test]
+    fn beta173_keepalive_is_single_packet_id_byte() {
+        let mut payload = Vec::new();
+        KeepAlivePacket.encode(&mut payload).unwrap();
+
+        let mut encoded = Vec::new();
+        LegacyPacketFrameCodec::write(
+            &PacketFrame::new(KeepAlivePacket::ID, payload),
+            &mut encoded,
+        )
+        .unwrap();
+
+        assert_eq!(vec![0x00], encoded);
+
+        let mut input = std::io::Cursor::new([KeepAlivePacket::ID, 0x0A, 0x01]);
+        let frame = LegacyPacketFrameCodec::read(
+            &mut input,
+            ServerboundPacketKind::KeepAlive
+                .fixed_payload_length()
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(KeepAlivePacket::ID, frame.packet_id());
+        assert!(frame.payload().is_empty());
+        assert_eq!(1, input.position());
+    }
+
+    #[test]
     fn handshake_round_trips_payload_and_frame() {
         let packet = HandshakePacket::new("Alex");
         let frame = HandshakePacketCodec::to_frame(&packet).unwrap();
@@ -1854,7 +1878,7 @@ mod tests {
             ServerboundPacketKind::PlayerPositionLook.fixed_payload_length()
         );
         assert_eq!(
-            Some(4),
+            Some(0),
             ServerboundPacketKind::KeepAlive.fixed_payload_length()
         );
         assert_eq!(
@@ -1927,11 +1951,13 @@ mod tests {
 
     #[test]
     fn decodes_serverbound_interaction_packets() {
-        let keepalive = KeepAlivePacket::decode(&mut [0x00, 0x00, 0x00, 0x2A].as_slice()).unwrap();
-        assert_eq!(KeepAlivePacket { keep_alive_id: 42 }, keepalive);
+        let mut keepalive_input = [0x0A, 0x01].as_slice();
+        let keepalive = KeepAlivePacket::decode(&mut keepalive_input).unwrap();
+        assert_eq!(KeepAlivePacket, keepalive);
+        assert_eq!(&[0x0A, 0x01], keepalive_input);
         let mut keepalive_bytes = Vec::new();
         keepalive.encode(&mut keepalive_bytes).unwrap();
-        assert_eq!(vec![0x00, 0x00, 0x00, 0x2A], keepalive_bytes);
+        assert_eq!(Vec::<u8>::new(), keepalive_bytes);
 
         let animation =
             ServerboundAnimationPacket::decode(&mut [0x00, 0x00, 0x00, 0x2A, 0x01].as_slice())
@@ -2342,24 +2368,50 @@ mod tests {
 
     #[test]
     fn clientbound_block_change_encodes_expected_payload() {
-        let mut payload = Vec::new();
-
-        ClientboundBlockChangePacketCodec::encode(
-            &ClientboundBlockChangePacket {
-                x: -1,
+        assert_block_change_payload(
+            ClientboundBlockChangePacket {
+                x: -4,
                 y: 64,
-                z: 2,
+                z: 7,
                 block_type: 3,
                 metadata: 0,
             },
-            &mut payload,
-        )
-        .unwrap();
-
-        assert_eq!(
-            vec![0xFF, 0xFF, 0xFF, 0xFF, 64, 0, 0, 0, 2, 0, 3, 0, 0, 0, 0],
-            payload
+            &[0xFF, 0xFF, 0xFF, 0xFC, 64, 0, 0, 0, 7, 0x03, 0x00],
         );
+        assert_block_change_payload(
+            ClientboundBlockChangePacket {
+                x: 0,
+                y: 63,
+                z: 0,
+                block_type: 1,
+                metadata: 0,
+            },
+            &[0, 0, 0, 0, 63, 0, 0, 0, 0, 0x01, 0x00],
+        );
+        assert_block_change_payload(
+            ClientboundBlockChangePacket {
+                x: 0,
+                y: 63,
+                z: 0,
+                block_type: 2,
+                metadata: 0,
+            },
+            &[0, 0, 0, 0, 63, 0, 0, 0, 0, 0x02, 0x00],
+        );
+    }
+
+    fn assert_block_change_payload(packet: ClientboundBlockChangePacket, expected: &[u8]) {
+        let mut payload = Vec::new();
+
+        ClientboundBlockChangePacketCodec::encode(&packet, &mut payload).unwrap();
+
+        assert_eq!(11, payload.len());
+        assert_eq!(expected, payload.as_slice());
+        assert_eq!(&expected[9..11], &payload[9..11]);
+
+        let mut frame = vec![ClientboundBlockChangePacket::ID];
+        frame.extend_from_slice(&payload);
+        assert_eq!(12, frame.len());
     }
 
     #[test]

@@ -18,10 +18,11 @@ Aurelia is unofficial and is not affiliated with Mojang, Microsoft, or Minecraft
 - Latest manual real-client testing reached clean quit after login, chunks,
   movement, break/place, crouch/entity action, inventory open/close, and many
   `0x66` WindowClick packets.
-- `0x00` KeepAlive is sent periodically when enabled. Serverbound KeepAlive
-  decode is compatibility-gated by `--keepalive-mode`; the default
-  `serverbound-no-payload` does not consume four bytes from the following
-  stream until the Beta 1.7.3 serverbound payload shape is verified.
+- `0x00` KeepAlive is sent periodically when enabled. Beta 1.7.3 KeepAlive is
+  a bare packet ID in both directions. Serverbound KeepAlive decode is
+  compatibility-gated by `--keepalive-mode`; the default
+  `serverbound-no-payload` consumes no payload, while `serverbound-int32`
+  remains available for trace comparison only.
 - `0x03` Chat is decoded and echoed to the sender; debug slash commands are
   implemented for `/aurelia`, `/whereami`, `/givebasic`, `/save`, `/setblock`,
   and `/time`.
@@ -64,7 +65,8 @@ Aurelia is unofficial and is not affiliated with Mojang, Microsoft, or Minecraft
   off|serverbound-no-payload|serverbound-int32`, `--defer-inventory-sync`, and
   `--post-join-minimal` are available as narrow compatibility toggles for the
   new clientbound survival-session features.
-- Server sends `S->C 0x35 BlockChange` after accepted or rejected block edits.
+- Server sends Beta-shaped 11-byte `S->C 0x35 BlockChange` payloads after
+  accepted or rejected block edits.
 - Chunk view tracking sends missing nearby chunks when the player changes
   chunks and sends `S->C 0x32` visibility unloads for chunks that leave the
   configured radius.
@@ -74,6 +76,13 @@ Aurelia is unofficial and is not affiliated with Mojang, Microsoft, or Minecraft
   format under `<world>/aurelia-flat-v1/`.
 - Basic player state is saved and reloaded from an Aurelia-native format under
   `<world>/aurelia-players-v1/`.
+- `--world-format=auto|aurelia-flat|vanilla-beta173` selects the world save
+  backend. Auto mode prefers a vanilla Beta-style world when `<world>/level.dat`
+  and `<world>/region/*.mcr` exist, otherwise it uses Aurelia flat storage.
+- Initial vanilla Beta 1.7.3 save compatibility can read/write gzip NBT
+  `level.dat`, player files under `<world>/players/`, and McRegion `.mcr`
+  chunk block IDs plus metadata. Unknown NBT is preserved where possible when
+  chunks or players are rewritten.
 - Block get/set/break/place exists in world state with dirty chunk tracking and
   rule-driven inventory drops.
 - Server-side health/death state, fall damage, void damage, and a respawn
@@ -81,9 +90,10 @@ Aurelia is unofficial and is not affiliated with Mojang, Microsoft, or Minecraft
   verified.
 - Survival gameplay is still incomplete: crafting, smelting, chests, workbench
   UI, item entities, visible mobs, and combat are not implemented.
-- Placement remains conservative: blocks are placed only into air, with no
-  replaceable-block table, collision checks, or full use-on-block item behavior
-  yet.
+- Placement remains conservative: blocks are placed only into air and solid
+  blocks are rejected when they intersect the player's current collision box.
+  Replaceable-block tables, orientation, and full use-on-block item behavior are
+  still missing.
 
 The current repository is an early playable-test foundation, not a complete compatibility claim.
 
@@ -108,11 +118,11 @@ capturing regressions, but do not treat this as a full compatibility claim.
 - Verify position, inventory, and world edits persist.
 - Verify no client crash or disconnect.
 
-## Native Persistence Format
+## Persistence Formats
 
-The current persistence format is Aurelia-native and only stores modified
-flat-world chunks. Each dirty chunk is written as `c.<chunkX>.<chunkZ>.achunk`
-inside `<world>/aurelia-flat-v1/` with:
+The Aurelia flat persistence format stores modified flat-world chunks. Each
+dirty chunk is written as `c.<chunkX>.<chunkZ>.achunk` inside
+`<world>/aurelia-flat-v1/` with:
 
 - magic bytes `AURELIA-CHUNK-1`;
 - big-endian `i32` chunk X and Z;
@@ -123,8 +133,30 @@ Player data is written as simple text `.aplayer` files under
 `<world>/aurelia-players-v1/` with username, position, rotation, health, spawn
 position, selected hotbar slot, and player inventory slots.
 
-Unchanged chunks are generated from the flat-world generator. These formats are
-not Anvil, McRegion, NBT, or vanilla-compatible save formats.
+Unchanged Aurelia flat chunks are generated from the flat-world generator.
+
+Vanilla Beta 1.7.3 mode is selected with:
+
+```bash
+cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --world ./world --world-format=vanilla-beta173 --chunk-radius 1 --compat-debug
+```
+
+This mode reads and writes Beta-era NBT and McRegion files directly:
+
+- `level.dat`: spawn and time are loaded; `Time` and `LastPlayed` are updated
+  on save; unknown tags are retained structurally.
+- `region/*.mcr`: existing chunk `Blocks` and `Data` arrays load into Aurelia
+  chunks and dirty chunks save back to the same region file. Unrelated chunks
+  in the same region are preserved byte-for-byte when possible.
+- `players/<username>.dat`: position, rotation, health, spawn, and
+  representable inventory slots are loaded and saved. Unsupported original
+  inventory entries are kept in the rewritten list where possible.
+
+Known limitations: missing vanilla chunks are sent as air rather than generated
+with vanilla terrain; tile entities and entities are NBT-preserved but not
+functionally implemented; lighting is preserved when present and placeholdered
+for new edited chunks, but not recalculated exactly; Nether/DIM-1 is not
+supported; this is not full vanilla save parity.
 
 ## Compatibility Principles
 
@@ -132,7 +164,8 @@ not Anvil, McRegion, NBT, or vanilla-compatible save formats.
 - Behavior notes should be written cleanly and independently.
 - Implementation code must stay original.
 - Do not include Mojang source code, Minecraft assets, generated jars, decompiled source, copied protocol code, or copied server/modding project implementations.
-- Current persistence is Aurelia-native and not vanilla McRegion/NBT.
+- Vanilla save compatibility should preserve unknown data where possible and
+  fail clearly rather than corrupting unsupported worlds.
 
 ## TODOs
 

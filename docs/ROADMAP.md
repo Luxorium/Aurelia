@@ -13,6 +13,8 @@ The current milestone proves an early real-client foundation:
 - Early Beta 1.7.3 block/item rule tables.
 - Server-side health/death/fall/void foundations.
 - Aurelia-native dirty chunk and basic player persistence.
+- Initial vanilla Beta 1.7.3 `level.dat`, McRegion chunk, and player-file
+  load/save foundation.
 
 This milestone is not a full compatibility claim.
 
@@ -25,6 +27,8 @@ This milestone is not a full compatibility claim.
 - Add replaceable-block and collision semantics for placement.
 - Add item entities for overflow drops and pickups.
 - Verify client-visible health/death/respawn packets before sending them.
+- Harden vanilla save compatibility with more synthetic fixtures and
+  black-box import/export checks.
 - Improve persistence tests for Aurelia-native chunk and player formats.
 
 ## 0.3.x - Containers, Crafting, And Furnaces
@@ -35,12 +39,12 @@ This milestone is not a full compatibility claim.
 - Furnace tile entity, fuel, cook time, and UI.
 - More complete inventory transaction behavior.
 
-## 0.4.x - Vanilla Terrain/Worldgen And McRegion/NBT Parity
+## 0.4.x - Vanilla Terrain/Worldgen And Deeper Save Parity
 
 - Vanilla-style terrain generation from clean-room behavior notes.
 - Trees, ores, caves, and biome-adjacent rules as verified.
-- McRegion/NBT world persistence.
-- Vanilla-compatible player and tile-entity save data.
+- Exact lighting behavior, tile-entity function, entity persistence, Nether
+  support, and broader McRegion/NBT parity.
 
 ## 0.5.x - Entities, Item Entities, And Mobs
 
