@@ -1481,15 +1481,17 @@ pub fn read_legacy_string_truncated(
     validate_max_chars(max_chars)?;
     validate_max_chars(hard_max_chars)?;
     let length = read_u16(input)? as usize;
+    if length > hard_max_chars {
+        return Err(ProtocolError::InvalidData(format!(
+            "legacy string length {length} exceeds hard max {hard_max_chars}"
+        )));
+    }
     let kept_len = length.min(max_chars);
     let mut kept = Vec::with_capacity(kept_len);
     for index in 0..length {
         let unit = read_u16(input)?;
         if index < kept_len {
             kept.push(unit);
-        }
-        if index >= hard_max_chars {
-            continue;
         }
     }
     Ok(String::from_utf16_lossy(&kept))
@@ -2071,6 +2073,39 @@ mod tests {
             },
             confirm
         );
+    }
+
+    #[test]
+    fn truncated_legacy_string_rejects_length_beyond_hard_max_before_reading_payload() {
+        // A claimed length above the hard max must fail fast instead of
+        // forcing the server to read and discard up to 128 KiB per packet.
+        let oversized_length = (ChatPacket::MESSAGE_HARD_MAX_CHARS + 1) as u16;
+        let bytes = oversized_length.to_be_bytes();
+
+        let error = read_legacy_string_truncated(
+            &mut bytes.as_slice(),
+            ChatPacket::MESSAGE_MAX_CHARS,
+            ChatPacket::MESSAGE_HARD_MAX_CHARS,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ProtocolError::InvalidData(_)));
+    }
+
+    #[test]
+    fn truncated_legacy_string_still_truncates_between_max_and_hard_max() {
+        let mut bytes = Vec::new();
+        write_legacy_string(&mut bytes, &"y".repeat(120), 512).unwrap();
+
+        let decoded = read_legacy_string_truncated(
+            &mut bytes.as_slice(),
+            ChatPacket::MESSAGE_MAX_CHARS,
+            ChatPacket::MESSAGE_HARD_MAX_CHARS,
+        )
+        .unwrap();
+
+        assert_eq!(ChatPacket::MESSAGE_MAX_CHARS, decoded.len());
+        assert!(decoded.chars().all(|ch| ch == 'y'));
     }
 
     #[test]

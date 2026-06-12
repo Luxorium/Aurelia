@@ -38,7 +38,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const VERSION: &str = "0.2.0-SNAPSHOT";
+pub const VERSION: &str = "0.2.0";
 pub const HANDSHAKE_RECEIVED_DISCONNECT: &str =
     "Aurelia received your handshake, but login is not implemented yet.";
 pub const MISSING_PACKET_DISCONNECT: &str =
@@ -393,6 +393,14 @@ impl ServerConfig {
             defer_inventory_sync: true,
             post_join_minimal: false,
         }
+    }
+
+    pub const fn time_update_active(&self) -> bool {
+        self.time_update_enabled && !matches!(self.time_update_mode, TimeUpdateMode::Off)
+    }
+
+    pub const fn keepalive_active(&self) -> bool {
+        self.keepalive_enabled && !matches!(self.keepalive_mode, KeepAliveMode::Off)
     }
 
     fn validate(&self) -> Result<()> {
@@ -1379,16 +1387,17 @@ fn player_file_path(dir: &Path, username: &str) -> PathBuf {
 }
 
 fn sanitized_player_name(username: &str) -> String {
-    username
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    // Escapes are dot-delimited and '.' is never passed through, so two
+    // distinct usernames can never share a save file name.
+    let mut sanitized = String::with_capacity(username.len());
+    for ch in username.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push_str(&format!(".{:x}.", u32::from(ch)));
+        }
+    }
+    sanitized
 }
 
 fn write_player_file(dir: &Path, player: &PlayerState) -> io::Result<()> {
@@ -1836,22 +1845,17 @@ impl PlayerSession {
         }
 
         let username = login.username;
-        let entity_id = {
+        let (entity_id, saved_player) = {
             let mut state = self
                 .state_ref
                 .lock()
                 .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
-            state.register_player(username.clone())
+            let entity_id = state.register_player(username.clone());
+            let saved_player = state.load_player_state(&username, entity_id)?;
+            (entity_id, saved_player)
         };
         self.registered_username = Some(username.clone());
-        self.player = {
-            let state = self
-                .state_ref
-                .lock()
-                .map_err(|_| ServerError::InvalidConfig("game state lock poisoned".to_string()))?;
-            state.load_player_state(&username, entity_id)?
-        }
-        .or_else(|| Some(PlayerState::new(username, entity_id)));
+        self.player = saved_player.or_else(|| Some(PlayerState::new(username, entity_id)));
         self.send_join_sequence(connection)?;
         self.state = ConnectionState::Joined;
         Ok(None)
@@ -2112,7 +2116,7 @@ impl PlayerSession {
             );
         }
         self.send_deferred_inventory_if_due(connection)?;
-        if self.config.keepalive_enabled && !self.config.post_join_minimal {
+        if self.config.keepalive_active() && !self.config.post_join_minimal {
             self.last_keepalive_sent_at = Instant::now();
             eprintln!(
                 "[session] keepalive scheduler started player={}",
@@ -2864,8 +2868,7 @@ impl PlayerSession {
     }
 
     fn should_send_time_update(&self) -> bool {
-        self.config.time_update_enabled
-            && self.config.time_update_mode != TimeUpdateMode::Off
+        self.config.time_update_active()
             && !self.config.post_join_minimal
             && self.join_phase == JoinPhase::JoinedReady
             && (self.config.time_update_mode == TimeUpdateMode::Interval
@@ -3016,7 +3019,7 @@ impl PlayerSession {
     }
 
     fn send_keepalive(&mut self, connection: &mut impl Write) -> Result<()> {
-        if !self.config.keepalive_enabled
+        if !self.config.keepalive_active()
             || self.config.post_join_minimal
             || self.join_phase != JoinPhase::JoinedReady
         {
@@ -3042,13 +3045,13 @@ impl PlayerSession {
         }
         let now = Instant::now();
         if self.config.time_update_mode == TimeUpdateMode::Interval
-            && self.config.time_update_enabled
+            && self.config.time_update_active()
             && !self.config.post_join_minimal
             && now.duration_since(self.last_time_sent_at) >= Self::TIME_UPDATE_INTERVAL
         {
             self.send_time_update(connection)?;
         }
-        if self.config.keepalive_enabled
+        if self.config.keepalive_active()
             && !self.config.post_join_minimal
             && now.duration_since(self.last_keepalive_sent_at) >= Self::KEEPALIVE_INTERVAL
         {
@@ -4016,6 +4019,37 @@ mod tests {
         assert_eq!(KeepAliveMode::ServerboundNoPayload, config.keepalive_mode);
         assert!(config.defer_inventory_sync);
         assert!(!config.post_join_minimal);
+    }
+
+    #[test]
+    fn sanitized_player_names_never_collide() {
+        assert_eq!("Luxorium", sanitized_player_name("Luxorium"));
+        assert_eq!("a_b", sanitized_player_name("a_b"));
+        assert_ne!(sanitized_player_name("a b"), sanitized_player_name("a_b"));
+        assert_ne!(sanitized_player_name("a.b"), sanitized_player_name("a_b"));
+        assert_ne!(sanitized_player_name("a b"), sanitized_player_name("a.b"));
+        assert!(sanitized_player_name("a b")
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'));
+    }
+
+    #[test]
+    fn config_activity_helpers_require_enabled_flag_and_mode_to_agree() {
+        let mut config = ServerConfig::default_config();
+        assert!(config.time_update_active());
+        assert!(config.keepalive_active());
+
+        config.time_update_enabled = false;
+        config.keepalive_enabled = false;
+        assert!(!config.time_update_active());
+        assert!(!config.keepalive_active());
+
+        config.time_update_enabled = true;
+        config.keepalive_enabled = true;
+        config.time_update_mode = TimeUpdateMode::Off;
+        config.keepalive_mode = KeepAliveMode::Off;
+        assert!(!config.time_update_active());
+        assert!(!config.keepalive_active());
     }
 
     #[test]

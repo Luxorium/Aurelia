@@ -152,15 +152,6 @@ pub fn clamp(value: i32, min: i32, max: i32) -> Result<i32, AureliaError> {
     Ok(value.max(min).min(max))
 }
 
-pub fn floor_to_int(value: f64) -> i32 {
-    let truncated = value as i32;
-    if value < truncated as f64 {
-        truncated - 1
-    } else {
-        truncated
-    }
-}
-
 pub const TICKS_PER_SECOND: u32 = 20;
 pub const MILLIS_PER_TICK: u64 = 50;
 
