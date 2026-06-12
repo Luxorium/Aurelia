@@ -4,6 +4,20 @@ All notable changes to Aurelia will be documented in this file.
 
 ## Unreleased
 
+## 0.2.1 - Save Compatibility Hardening (2026-06-12)
+
+### Added
+
+- Vanilla Beta 1.7.3 world save foundation with save/load round-trip support.
+
+### Changed
+
+- Comprehensive tests for vanilla save compatibility paths.
+
+### Fixed
+
+- Clippy hygiene cleanup across the workspace.
+
 ## 0.2.0 - Vanilla Parity Foundation (2026-06-11)
 
 ### Added
