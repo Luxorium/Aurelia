@@ -7,7 +7,7 @@ Aurelia is a clean-room Minecraft Beta 1.7.3-compatible dedicated server rewrite
 
 ## Current Status
 
-Aurelia is currently at version `0.2.0`, the **Vanilla Parity Foundation** milestone.
+Aurelia is currently at version `0.2.2`.
 
 A real Beta 1.7.3 client can join the experimental world path, receive chunks, move, cross chunk boundaries with chunk load/unload visibility updates, break and place blocks from a starter hotbar, use basic chat/debug commands, perform conservative inventory clicks, save dirty world edits and basic player state, quit cleanly, and rejoin with saved edits. Aurelia can also load and save an initial clean-room subset of vanilla Beta 1.7.3 McRegion/NBT worlds.
 
@@ -15,10 +15,10 @@ This is still an early compatibility foundation. Aurelia is not a complete Beta 
 
 ## What Works Today
 
+- Zero-argument launch: `./aurelia-server` reads `server.properties`, generates defaults if missing, auto-detects world format, and binds on port `25565`.
 - Blocking TCP listener with per-connection player sessions.
 - Clean-room Beta 1.7.3 protocol `14` handshake and observed serverbound login decoding.
-- Experimental real-client join path behind `--experimental-join --playable-flat-world`.
-- Flat chunk generation and chunk visibility load/unload updates while crossing chunk boundaries.
+- Real-client join path: flat chunk generation, chunk visibility load/unload while crossing chunk boundaries.
 - Movement tracking, chat echo, and short debug commands.
 - Starter hotbar sync, held-slot tracking, and conservative player inventory window clicks.
 - Clean-room rule tables covering every Beta 1.7.3 block and item id, driving stack sizes, harvest requirements, and drops for survival break/place testing.
@@ -46,32 +46,56 @@ Known vanilla save limitations: missing McRegion chunks are sent as air instead 
 ```bash
 cargo fmt --all
 cargo test --workspace
-cargo build --workspace
+cargo build --workspace --release
+cp target/release/aurelia-server .
+./aurelia-server
 ```
 
-Run a startup smoke test that binds to an ephemeral local port and exits:
+On first run, Aurelia generates a `server.properties` in the current directory and creates a `./world` folder. A Beta 1.7.3 client can connect on port `25565`.
+
+**To use an existing vanilla Beta 1.7.3 world:**
+
+1. Place your world folder at `./world` (must contain `level.dat` and `region/*.mcr` files).
+2. Run `./aurelia-server` — Aurelia auto-detects the vanilla world format.
+
+**Stopping the server:** `Ctrl+C`.
+
+### server.properties
+
+Aurelia reads `server.properties` from the current directory. A default file is generated on first run. Supported keys:
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `server-port` | `25565` | TCP listen port |
+| `server-ip` | *(blank)* | Bind address; blank = all interfaces (`0.0.0.0`) |
+| `level-name` | `world` | World folder path |
+| `motd` | `A Minecraft Server` | Server list message |
+| `max-players` | `20` | Parsed; not yet enforced |
+| `online-mode` | `false` | Must be `false`; session auth not implemented |
+| `view-distance` | `1` | Chunk radius sent to clients (0–8) |
+
+Keys parsed but not yet enforced (Aurelia warns and continues):
+
+`spawn-protection`, `white-list`, `allow-nether`, `difficulty`, `gamemode`
+
+Unknown keys are silently ignored and never crash the server.
+
+### CLI flags (debug/dev only)
+
+Normal users do not need any flags. These are available for testing and debugging:
 
 ```bash
+# Smoke test: bind to a random port and exit immediately
 cargo run -p aurelia-server -- --smoke-test --host 127.0.0.1 --port 0
+
+# Verbose packet tracing
+cargo run -p aurelia-server -- --compat-debug --trace-packets --trace-packet-limit 512
+
+# Override world path or format
+cargo run -p aurelia-server -- --world ./myworld --world-format=vanilla-beta173
 ```
 
-Run the experimental real-client flat-world path:
-
-```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --playable-flat-world --chunk-radius 1 --compat-debug --trace-packets --trace-packet-limit 512
-```
-
-Run against an existing vanilla Beta 1.7.3-style world folder:
-
-```bash
-cargo run -p aurelia-server -- --host 127.0.0.1 --port 25565 --experimental-join --world ./world --world-format=vanilla-beta173 --chunk-radius 1 --compat-debug
-```
-
-For a smoke test of the experimental path without keeping the server running:
-
-```bash
-cargo run -p aurelia-server -- --smoke-test --host 127.0.0.1 --port 0 --experimental-join --playable-flat-world
-```
+CLI flags override `server.properties`, which overrides built-in defaults.
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for setup, tracing flags, compatibility-report guidance, and local testing notes.
 

@@ -6,6 +6,7 @@ Cargo.lock
 /world/
 /logs/
 *.log
+/server.properties
 
 # editor/system junk
 .vscode/

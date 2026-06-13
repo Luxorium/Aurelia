@@ -1,3 +1,5 @@
+pub mod properties;
+
 use aurelia_common::{beta173 as item_rules, BlockPos, ChunkPos, ChunkView};
 use aurelia_protocol::{
     experimental_flat_chunk_data, read_u8, ChatPacket, ClientboundBeta173TimeUpdatePacket,
@@ -40,7 +42,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.2";
 pub const HANDSHAKE_RECEIVED_DISCONNECT: &str =
     "Aurelia received your handshake, but login is not implemented yet.";
 pub const MISSING_PACKET_DISCONNECT: &str =
@@ -210,6 +212,9 @@ pub struct ServerConfig {
     pub defer_inventory_sync: bool,
     pub post_join_minimal: bool,
     pub world_storage_mode: WorldStorageMode,
+    pub motd: String,
+    pub max_players: u32,
+    pub online_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +404,9 @@ impl ServerConfig {
             defer_inventory_sync,
             post_join_minimal,
             world_storage_mode: WorldStorageMode::Auto,
+            motd: "A Minecraft Server".to_string(),
+            max_players: 20,
+            online_mode: false,
         };
         config.validate()?;
         Ok(config)
@@ -413,9 +421,9 @@ impl ServerConfig {
             packet_trace_limit: Self::DEFAULT_PACKET_TRACE_LIMIT,
             trace_continue_after_handshake: false,
             trace_handshake_response: Self::DEFAULT_TRACE_HANDSHAKE_RESPONSE.to_string(),
-            experimental_join_enabled: false,
+            experimental_join_enabled: true,
             login_response_mode: ClientboundLoginResponseMode::Beta173Observed,
-            playable_flat_world: false,
+            playable_flat_world: true,
             initial_chunk_radius: Self::DEFAULT_INITIAL_CHUNK_RADIUS,
             inventory_sync_enabled: true,
             time_update_enabled: true,
@@ -425,6 +433,9 @@ impl ServerConfig {
             defer_inventory_sync: true,
             post_join_minimal: false,
             world_storage_mode: WorldStorageMode::Auto,
+            motd: "A Minecraft Server".to_string(),
+            max_players: 20,
+            online_mode: false,
         }
     }
 
@@ -461,8 +472,29 @@ impl ServerConfig {
     }
 }
 
-pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
-    let defaults = ServerConfig::default_config();
+/// Apply `ServerProperties` fields onto an existing `ServerConfig`.
+///
+/// `server-ip` empty → binds to `0.0.0.0`. CLI args passed later to
+/// `parse_config_over` override whatever this function sets.
+pub fn apply_server_properties(config: &mut ServerConfig, props: &properties::ServerProperties) {
+    config.host = if props.server_ip.trim().is_empty() {
+        "0.0.0.0".to_string()
+    } else {
+        props.server_ip.clone()
+    };
+    config.port = props.server_port;
+    config.world_name = props.level_name.clone();
+    config.motd = props.motd.clone();
+    config.max_players = props.max_players;
+    config.online_mode = props.online_mode;
+    config.initial_chunk_radius = props.view_distance;
+}
+
+/// Parse CLI args on top of a caller-supplied `defaults` config.
+///
+/// Precedence (highest first): CLI args → `defaults` (which the caller
+/// typically pre-filled from server.properties) → built-in code defaults.
+pub fn parse_config_over(defaults: ServerConfig, args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     let mut host = defaults.host;
     let mut port = defaults.port;
     let mut world_name = defaults.world_name;
@@ -482,6 +514,9 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     let mut defer_inventory_sync = defaults.defer_inventory_sync;
     let mut post_join_minimal = defaults.post_join_minimal;
     let mut world_storage_mode = defaults.world_storage_mode;
+    let motd = defaults.motd;
+    let max_players = defaults.max_players;
+    let online_mode = defaults.online_mode;
 
     let mut index = 0;
     while index < args.len() {
@@ -598,8 +633,19 @@ pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
     config.time_update_mode = time_update_mode;
     config.keepalive_mode = keepalive_mode;
     config.world_storage_mode = world_storage_mode;
+    config.motd = motd;
+    config.max_players = max_players;
+    config.online_mode = online_mode;
     config.validate()?;
     Ok(config)
+}
+
+/// Parse CLI args using built-in defaults as the base config.
+///
+/// For production use `parse_config_over` with a base already filled from
+/// `apply_server_properties` so server.properties values are respected.
+pub fn parse_config(args: &[impl AsRef<str>]) -> Result<ServerConfig> {
+    parse_config_over(ServerConfig::default_config(), args)
 }
 
 fn required_arg_value<'a>(
@@ -3050,7 +3096,12 @@ impl PlayerSession {
             return Ok(());
         }
 
-        let desired = selected_placeable_block(inventory.expect("validated inventory"));
+        // placement_rejection_reason returns NoSelectedItem when inventory is None,
+        // so reaching here guarantees inventory is Some.
+        let Some(inventory) = inventory else {
+            return Ok(());
+        };
+        let desired = selected_placeable_block(inventory);
         let placed = self.with_game_state(|state| Ok(state.place_block(target, desired)))?;
         let actual = if placed {
             desired
@@ -3068,7 +3119,7 @@ impl PlayerSession {
                 packet,
                 clicked,
                 Some(target),
-                inventory,
+                Some(inventory),
                 clicked_state.unwrap_or(BlockState::AIR),
                 Some(actual),
                 "placed",
@@ -3080,7 +3131,7 @@ impl PlayerSession {
                 packet,
                 clicked,
                 Some(target),
-                inventory,
+                Some(inventory),
                 clicked_state.unwrap_or(BlockState::AIR),
                 Some(actual),
                 "rejected",
@@ -4444,13 +4495,19 @@ impl ServerBootstrap {
         let _regions = RegionScheduler::default();
         eprintln!("Starting Aurelia {VERSION}");
         eprintln!("Target compatibility: {TARGET_VERSION}");
+        eprintln!("MOTD: {}", config.motd);
+        eprintln!("Bind address: {}:{}", config.host, config.port);
         eprintln!("World: {}", config.world_name);
         eprintln!(
-            "World format: {} (requested {})",
+            "World format: {} (auto-detected from {})",
             resolved_world_format.as_str(),
             requested_world_format.as_str()
         );
-        eprintln!("Bind address: {}:{}", config.host, config.port);
+        eprintln!("Max players: {}", config.max_players);
+        eprintln!(
+            "Online mode: {} (session auth not implemented)",
+            config.online_mode
+        );
 
         let listener = TcpListener::bind((config.host.as_str(), config.port))?;
         listener.set_nonblocking(true)?;
@@ -4581,7 +4638,7 @@ mod tests {
     use std::io::{Cursor, Read, Write};
 
     #[test]
-    fn default_config_uses_dedicated_server_port() {
+    fn default_config_is_production_ready() {
         let config = ServerConfig::default_config();
 
         assert_eq!("0.0.0.0", config.host);
@@ -4597,12 +4654,13 @@ mod tests {
             ServerConfig::DEFAULT_TRACE_HANDSHAKE_RESPONSE,
             config.trace_handshake_response
         );
-        assert!(!config.experimental_join_enabled);
+        // Join is enabled by default so ./aurelia-server works without flags.
+        assert!(config.experimental_join_enabled);
         assert_eq!(
             ClientboundLoginResponseMode::Beta173Observed,
             config.login_response_mode
         );
-        assert!(!config.playable_flat_world);
+        assert!(config.playable_flat_world);
         assert_eq!(
             ServerConfig::DEFAULT_INITIAL_CHUNK_RADIUS,
             config.initial_chunk_radius
@@ -4614,6 +4672,9 @@ mod tests {
         assert_eq!(KeepAliveMode::ServerboundNoPayload, config.keepalive_mode);
         assert!(config.defer_inventory_sync);
         assert!(!config.post_join_minimal);
+        assert_eq!("A Minecraft Server", config.motd);
+        assert_eq!(20, config.max_players);
+        assert!(!config.online_mode);
     }
 
     #[test]
@@ -8172,5 +8233,153 @@ mod tests {
         let mut input = bytes;
         assert_eq!(DisconnectPacket::ID, read_u8(&mut input).unwrap());
         DisconnectPacketCodec::decode(&mut input).unwrap().reason
+    }
+
+    // ---- server.properties integration tests --------------------------------
+
+    #[test]
+    fn no_argument_launch_enables_join_and_uses_vanilla_defaults() {
+        let empty: [&str; 0] = [];
+        let config = parse_config(&empty).unwrap();
+
+        // Join must be enabled without any flags so ./aurelia-server works.
+        assert!(
+            config.experimental_join_enabled || config.playable_flat_world,
+            "default config must allow player join without CLI flags"
+        );
+        assert_eq!("world", config.world_name);
+        assert_eq!(25565, config.port);
+        assert_eq!("0.0.0.0", config.host);
+        assert_eq!("A Minecraft Server", config.motd);
+        assert_eq!(20, config.max_players);
+        assert!(!config.online_mode);
+    }
+
+    #[test]
+    fn apply_server_properties_maps_all_active_fields() {
+        let props = properties::ServerProperties {
+            server_port: 19132,
+            server_ip: "10.0.0.1".to_string(),
+            level_name: "myworld".to_string(),
+            motd: "Hello!".to_string(),
+            max_players: 50,
+            online_mode: false,
+            view_distance: 3,
+            ..Default::default()
+        };
+        let mut config = ServerConfig::default_config();
+        apply_server_properties(&mut config, &props);
+
+        assert_eq!(19132, config.port);
+        assert_eq!("10.0.0.1", config.host);
+        assert_eq!("myworld", config.world_name);
+        assert_eq!("Hello!", config.motd);
+        assert_eq!(50, config.max_players);
+        assert!(!config.online_mode);
+        assert_eq!(3, config.initial_chunk_radius);
+    }
+
+    #[test]
+    fn apply_server_properties_empty_ip_binds_to_all_interfaces() {
+        let props = properties::ServerProperties {
+            server_ip: String::new(),
+            ..Default::default()
+        };
+        let mut config = ServerConfig::default_config();
+        apply_server_properties(&mut config, &props);
+
+        assert_eq!("0.0.0.0", config.host);
+    }
+
+    #[test]
+    fn apply_server_properties_whitespace_only_ip_binds_to_all_interfaces() {
+        let props = properties::ServerProperties {
+            server_ip: "   ".to_string(),
+            ..Default::default()
+        };
+        let mut config = ServerConfig::default_config();
+        apply_server_properties(&mut config, &props);
+
+        assert_eq!("0.0.0.0", config.host);
+    }
+
+    #[test]
+    fn parse_config_over_cli_port_overrides_properties() {
+        let props = properties::ServerProperties {
+            server_port: 19132,
+            ..Default::default()
+        };
+        let mut base = ServerConfig::default_config();
+        apply_server_properties(&mut base, &props);
+
+        let config = parse_config_over(base, &["--port=25565"]).unwrap();
+
+        assert_eq!(25565, config.port);
+    }
+
+    #[test]
+    fn parse_config_over_cli_host_overrides_server_ip() {
+        let props = properties::ServerProperties {
+            server_ip: "192.168.1.1".to_string(),
+            ..Default::default()
+        };
+        let mut base = ServerConfig::default_config();
+        apply_server_properties(&mut base, &props);
+
+        let config = parse_config_over(base, &["--host=127.0.0.1"]).unwrap();
+
+        assert_eq!("127.0.0.1", config.host);
+    }
+
+    #[test]
+    fn parse_config_over_cli_world_overrides_level_name() {
+        let props = properties::ServerProperties {
+            level_name: "myworld".to_string(),
+            ..Default::default()
+        };
+        let mut base = ServerConfig::default_config();
+        apply_server_properties(&mut base, &props);
+
+        let config = parse_config_over(base, &["--world=other"]).unwrap();
+
+        assert_eq!("other", config.world_name);
+    }
+
+    #[test]
+    fn parse_config_over_properties_view_distance_sets_chunk_radius() {
+        let props = properties::ServerProperties {
+            view_distance: 4,
+            ..Default::default()
+        };
+        let mut base = ServerConfig::default_config();
+        apply_server_properties(&mut base, &props);
+
+        let config = parse_config_over(base, &[] as &[&str]).unwrap();
+
+        assert_eq!(4, config.initial_chunk_radius);
+    }
+
+    #[test]
+    fn parse_config_over_cli_chunk_radius_overrides_view_distance() {
+        let props = properties::ServerProperties {
+            view_distance: 4,
+            ..Default::default()
+        };
+        let mut base = ServerConfig::default_config();
+        apply_server_properties(&mut base, &props);
+
+        let config = parse_config_over(base, &["--chunk-radius=2"]).unwrap();
+
+        assert_eq!(2, config.initial_chunk_radius);
+    }
+
+    #[test]
+    fn server_config_new_retains_explicit_join_disabled_for_tests() {
+        let config = ServerConfig::new("127.0.0.1", 0, "test-world").unwrap();
+
+        // ServerConfig::new uses with_options which explicitly sets these false —
+        // tests that rely on disconnect behavior continue to work.
+        assert!(!config.experimental_join_enabled);
+        assert!(!config.playable_flat_world);
     }
 }

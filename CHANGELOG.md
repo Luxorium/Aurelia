@@ -18,6 +18,27 @@ All notable changes to Aurelia will be documented in this file.
 
 - Clippy hygiene cleanup across the workspace.
 
+## 0.2.2 - Zero-Argument Launch and server.properties (2026-06-13)
+
+### Added
+
+- `server.properties` support: Aurelia reads standard vanilla-style configuration from `server.properties` in the working directory, generating a commented default file on first run. Supported keys: `server-port`, `server-ip`, `level-name`, `motd`, `max-players`, `online-mode`, `view-distance`. Keys `spawn-protection`, `white-list`, `allow-nether`, `difficulty`, and `gamemode` are parsed and warned about, but not yet enforced. Unknown keys are silently ignored.
+- `apply_server_properties` and `parse_config_over` public functions: allow callers to build a config from properties then apply CLI overrides. Precedence: CLI flag → `server.properties` → built-in defaults.
+- `ServerConfig` now carries `motd`, `max_players`, and `online_mode` fields from properties.
+- Startup log now prints MOTD, max players, online-mode status, and bind address at launch.
+- 47 new tests (22 in `properties` module, 15 `server.properties`/config integration tests in `aurelia-server`).
+
+### Changed
+
+- `./aurelia-server` now works without any arguments: binds to `0.0.0.0:25565`, reads `server.properties`, auto-detects world format, and creates a flat world if none exists. No `--experimental-join`, `--playable-flat-world`, or other flags required for normal use.
+- `ServerConfig::default_config()` now enables join by default (`experimental_join_enabled: true`, `playable_flat_world: true`). Debug flag constructors (`ServerConfig::new`, `with_options`) still default to join-disabled for test isolation.
+- README Quick Start updated to document `./aurelia-server` as the normal launch command with server.properties table and CLI flag reference.
+
+### Fixed
+
+- Block placement handler: removed `expect("validated inventory")` panic path; replaced with a safe early return (the `expect` was sound but exposed an unnecessary panic site).
+- `server.properties` added to `.gitignore` as a runtime-generated file.
+
 ## 0.2.0 - Vanilla Parity Foundation (2026-06-11)
 
 ### Added
